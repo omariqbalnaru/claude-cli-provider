@@ -85,7 +85,8 @@ export default function (cmd: ModApi): void {
       buildModel: ({ model }: { model: string }) =>
         createAnthropic({ baseURL: `${BASE}/v1`, apiKey: "claude-shim" })(model),
     },
-    auth: { methods: [] },
+    // No `auth`: cmd calls `auth.loader(...)` whenever `auth` is present, and
+    // the shim owns authentication (via Claude Code), so cmd must send none.
   });
 
   cmd.hooks({

@@ -1,0 +1,58 @@
+{
+  "name": "claude-cli-provider",
+  "version": "0.1.0",
+  "description": "Claude Pro/Max as a model provider for OMP, pi, and Command Code, routed through the Claude Code CLI",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "claude",
+    "claude-code",
+    "provider"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/extension.ts"
+    ]
+  },
+  "commandcode": {
+    "mods": [
+      "./src/mod.ts"
+    ]
+  },
+  "bin": {
+    "claude-shim": "./bin/claude-shim"
+  },
+  "files": [
+    "src/",
+    "shim/",
+    "bin/",
+    "README.md",
+    "LICENSE"
+  ],
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.274",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@ai-sdk/anthropic": "^4.0.57"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/omariqbalnaru/claude-cli-provider.git"
+  },
+  "homepage": "https://github.com/omariqbalnaru/claude-cli-provider#readme",
+  "bugs": {
+    "url": "https://github.com/omariqbalnaru/claude-cli-provider/issues"
+  }
+}

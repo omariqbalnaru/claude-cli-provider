@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# claude-shim — manage the Anthropic-wire server backed by Claude Code.
+#
+#   claude-shim start     boot it (idempotent)
+#   claude-shim stop      shut it down
+#   claude-shim status    health + model count
+#   claude-shim logs      tail its log
+#   claude-shim models <providers-json|models-yml|models-json> [port]
+#                         render this catalog as a harness config
+#
+# Auth comes from Claude Code's own Keychain entry via the official Agent SDK.
+# This never reads, extracts, or replays an OAuth token.
+set -euo pipefail
+
+# npm installs bins as symlinks, so resolve the link before taking dirname —
+# otherwise HERE points at node_modules/.bin and the shim path misses.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  TARGET="$(readlink "$SOURCE")"
+  case "$TARGET" in
+    /*) SOURCE="$TARGET" ;;
+    *) SOURCE="$(dirname "$SOURCE")/$TARGET" ;;
+  esac
+done
+HERE="$(cd "$(dirname "$SOURCE")" && pwd)"
+SHIM_DIR="$HERE/../shim"
+PORT="${CLAUDE_SHIM_PORT:-8792}"
+LOG="${CLAUDE_SHIM_LOG:-${TMPDIR:-/tmp}/claude-shim.log}"
+
+listener_pid() {
+  lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1
+}
+
+case "${1:-start}" in
+  models)
+    exec node "$SHIM_DIR/server.mjs" models "${2:-providers-json}" "${3:-$PORT}"
+    ;;
+  start)
+    if [ -n "$(listener_pid)" ]; then
+      echo "claude-shim already listening on :$PORT"
+      exit 0
+    fi
+    if [ ! -d "$SHIM_DIR/../node_modules" ]; then
+      echo "installing dependencies..." >&2
+      (cd "$SHIM_DIR/.." && npm install --omit=dev --ignore-scripts >/dev/null 2>&1) || {
+        echo "dependency install failed; run 'npm install' in $SHIM_DIR/.." >&2
+        exit 1
+      }
+    fi
+    echo "starting claude-shim on :$PORT ..."
+    # Detach with a real login environment (Keychain auth needs it).
+    USER="${USER:-$(id -un)}" LOGNAME="${LOGNAME:-$(id -un)}" \
+    SHELL="${SHELL:-/bin/sh}" TMPDIR="${TMPDIR:-/tmp}" \
+      nohup node "$SHIM_DIR/server.mjs" >>"$LOG" 2>&1 &
+    for _ in $(seq 40); do
+      if curl -sf -o /dev/null "http://127.0.0.1:$PORT/healthz" 2>/dev/null; then
+        echo "claude-shim up: http://127.0.0.1:$PORT/v1"
+        exit 0
+      fi
+      sleep 0.25
+    done
+    echo "shim failed to come up; see $LOG" >&2
+    exit 1
+    ;;
+  stop)
+    pid="$(listener_pid)"
+    if [ -n "$pid" ]; then
+      echo "stopping claude-shim (pid $pid)"
+      kill "$pid" 2>/dev/null || true
+    else
+      echo "nothing listening on :$PORT"
+    fi
+    ;;
+  status)
+    if [ -n "$(listener_pid)" ]; then
+      echo "claude-shim :$PORT -> up"
+      curl -s "http://127.0.0.1:$PORT/v1/models" \
+        | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>console.log("models exposed:",JSON.parse(s).data.length))'
+    else
+      echo "claude-shim :$PORT -> DOWN"
+      exit 1
+    fi
+    ;;
+  logs)
+    tail -n 40 -f "$LOG"
+    ;;
+  *)
+    echo "usage: claude-shim {start|stop|status|logs|models <fmt> [port]}" >&2
+    exit 2
+    ;;
+esac

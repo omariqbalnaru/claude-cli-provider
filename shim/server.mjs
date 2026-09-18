@@ -61,18 +61,42 @@ function textOf(content) {
   return "";
 }
 
+/**
+ * System blocks the harness rewrites on every request, which must not take part
+ * in the conversation identity.
+ *
+ * OMP injects `x-anthropic-billing-header: … cch=<attester>` as a system block
+ * and mints a new attester per request. Hashing it made every turn look like a
+ * new conversation, so the shim spawned a fresh SDK session per request: the
+ * model never saw its own history and repeated the same tool call until the
+ * turn cap (observed as an infinite tool-call loop).
+ */
+const VOLATILE_SYSTEM_BLOCK = /^x-anthropic-billing-header:/;
+
+function stableSystem(system) {
+  const blocks = Array.isArray(system)
+    ? system
+    : [{ type: "text", text: normalizeSystem(system) }];
+  return blocks
+    .filter((b) => !VOLATILE_SYSTEM_BLOCK.test(String(b?.text ?? "")))
+    .map((b) => String(b?.text ?? ""))
+    .join("\n\n");
+}
+
 // The wire carries no session id, so a conversation is identified by its
-// opening turn: model + system prompt + first real user message. The model is
-// part of the key because one harness can address several models with the same
-// opening message; without it the second model's turn would be routed onto the
-// first model's live SDK session.
+// opening turn: model + system prompt + first real user message. Every later
+// request in the same conversation replays a history that still starts with
+// that message, so the key stays stable. The model is part of the key because
+// one harness can address several models with the same opening message;
+// without it the second model's turn would be routed onto the first model's
+// live SDK session.
 function convKey(model, system, messages) {
   const firstUser = messages.find((m) => m.role === "user" && textOf(m.content));
   return crypto
     .createHash("sha1")
     .update(String(model ?? ""))
     .update("\u0000")
-    .update(normalizeSystem(system))
+    .update(stableSystem(system))
     .update("\u0000")
     .update(textOf(firstUser?.content ?? ""))
     .digest("hex");

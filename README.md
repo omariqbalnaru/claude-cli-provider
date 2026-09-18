@@ -33,10 +33,17 @@ cmd mods add -g <this-package>
 OMP and pi load `src/extension.ts` (both read the `pi.extensions` key).
 Command Code loads `src/mod.ts` (the `commandcode.mods` key).
 
-**All three install the same way** — the mod registers the provider and boots
-the shim, so no `providers.json` entry is required. `claude-shim models
-providers-json` still renders a block if you want the models declared there
-too (for `--list-models`, which does not load mods).
+**Command Code needs one extra step.** Its model picker and `--list-models`
+read `providers.json` and the built-in catalog — neither loads mods — so
+without an entry there the `claude-cli/*` models are invisible and
+unselectable:
+
+```bash
+claude-shim models providers-json      # print the block
+```
+
+Merge the output into `~/.commandcode/providers.json`. The mod still earns its
+place: it boots the shim, so a turn works without starting it by hand.
 
 ## Run the shim directly
 

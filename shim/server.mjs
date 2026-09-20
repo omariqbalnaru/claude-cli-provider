@@ -601,11 +601,14 @@ function emitTurn(res, conv, turn, wantStream) {
     return;
   }
 
-  res.writeHead(200, {
-    "content-type": "text/event-stream",
-    "cache-control": "no-cache",
-    connection: "keep-alive",
-  });
+  // The route already wrote the SSE head and started keepalive heartbeats.
+  if (!res.headersSent) {
+    res.writeHead(200, {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache",
+      connection: "keep-alive",
+    });
+  }
   const sse = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 
   sse("message_start", {
@@ -698,9 +701,23 @@ const server = http.createServer(async (req, res) => {
     }
 
     // Command Code probes with a trivial request first; answer it cheaply.
+    // Streaming requests get SSE keepalive comments while the child works —
+    // without bytes on the wire, pi's request timeout kills long turns.
+    const wantStream = body.stream === true;
+    let heartbeat = null;
+    if (wantStream) {
+      res.writeHead(200, {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache",
+        connection: "keep-alive",
+      });
+      heartbeat = setInterval(() => {
+        if (!res.writableEnded) res.write(": keepalive\n\n");
+      }, 10_000);
+    }
     try {
       const turn = await handleMessages(body, res);
-      emitTurn(res, conversations.get(convKey(body.model, body.system, Array.isArray(body.messages) ? body.messages : [])), turn, body.stream === true);
+      emitTurn(res, conversations.get(convKey(body.model, body.system, Array.isArray(body.messages) ? body.messages : [])), turn, wantStream);
     } catch (e) {
       log("request failed:", e?.stack ?? e);
       if (!res.headersSent) {
@@ -709,6 +726,8 @@ const server = http.createServer(async (req, res) => {
       } else {
         res.end();
       }
+    } finally {
+      if (heartbeat) clearInterval(heartbeat);
     }
     return;
   }

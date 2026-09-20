@@ -33,7 +33,7 @@ const MCP_PREFIX = `mcp__${MCP_SERVER_NAME}__`;
 const TOOL_USE_ID_META = "claudecode/toolUseId";
 
 import { MODELS, DEFAULT_PORT } from "./models.mjs";
-const log = (...a) => console.error("[claude-shim]", ...a);
+const log = (...a) => console.error("[claude-shim]", new Date().toISOString().slice(11, 23), ...a);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ---- helpers ---------------------------------------------------------------
@@ -272,6 +272,8 @@ function destroyConversation(key) {
   const conv = conversations.get(key);
   if (!conv) return;
   conversations.delete(key);
+  conv._abortWait?.({ aborted: true });
+  conv._abortWait = null;
   for (const resolve of conv.parked.values()) resolve("(tool call aborted: session ended)");
   conv.parked.clear();
   try {
@@ -299,6 +301,7 @@ async function nextTurn(conv) {
   let stopReason = null;
   let sawToolUse = false;
   let timedOut = false;
+  let aborted = false;
   const deadline = Date.now() + TURN_TIMEOUT_MS;
   while (Date.now() < deadline) {
     // The deadline is only checked between messages, so a wedged SDK child that
@@ -307,9 +310,17 @@ async function nextTurn(conv) {
     const winner = await Promise.race([
       conv.q.next().then((msg) => ({ msg })),
       sleep(deadline - Date.now()).then(() => null),
+      new Promise((resolve) => {
+        conv._abortWait = resolve;
+      }),
     ]);
+    conv._abortWait = null;
     if (!winner) {
       timedOut = true;
+      break;
+    }
+    if (winner.aborted) {
+      aborted = true;
       break;
     }
     const msg = winner.msg;
@@ -342,7 +353,8 @@ async function nextTurn(conv) {
     }
   }
   if (timedOut) log(`turn timed out after ${TURN_TIMEOUT_MS}ms with no SDK message`);
-  return { blocks, stopReason: stopReason ?? "end_turn", timedOut };
+  if (aborted) log("turn aborted by client disconnect");
+  return { blocks, stopReason: stopReason ?? "end_turn", timedOut, aborted };
 }
 
 // Push an effort change to a live query. The effort option is fixed at query()
@@ -375,7 +387,7 @@ async function applyEffort(conv, effort) {
   }
 }
 
-async function handleMessages(body) {
+async function handleMessages(body, res) {
   const messages = Array.isArray(body.messages) ? body.messages : [];
   const key = convKey(body.model, body.system, messages);
 
@@ -398,6 +410,32 @@ async function handleMessages(body) {
   }
   conv.last = Date.now();
 
+  // The conversation is stateful on the child side, so two concurrent requests
+  // for the same key (e.g. two pi instances resumed on one session) would
+  // interleave user pushes and steal each other's turns — one sees an empty
+  // response, the other hangs forever. Refuse the second writer instead.
+  if (conv.busy) {
+    log("concurrent request refused: conversation already in flight");
+    throw new Error("conversation already has a request in flight (another client is driving this session)");
+  }
+  conv.busy = true;
+  conv.aborted = false;
+  // A client that disconnects mid-turn (Ctrl-C on pi) must not keep the turn
+  // running as a ghost that consumes the child's next response.
+  res.on("close", () => {
+    // 'close' also fires after a response is written normally; only a
+    // mid-turn disconnect (response unfinished) is an abort.
+    if (res.writableEnded || conv.aborted || !conv.busy) return;
+    conv.aborted = true;
+    log("client disconnected mid-turn; aborting");
+    conv._abortWait?.({ aborted: true });
+    for (const [id, resolve] of conv.parked) {
+      conv.parked.delete(id);
+      resolve("(tool call aborted: client disconnected)");
+    }
+  });
+
+  try {
   // 1. Resolve parked tool calls with any tool_result blocks in this request.
   for (const m of messages) {
     if (m.role !== "user" || !Array.isArray(m.content)) continue;
@@ -433,7 +471,9 @@ async function handleMessages(body) {
   // A turn that ended on the timeout never got a single SDK message, so the
   // child is wedged (or gone silently); drop the conversation so the next
   // request starts a fresh child instead of blocking on the same corpse.
-  if (turn.timedOut) {
+  // Same for a client-disconnect abort: the child may have half-consumed the
+  // turn, so replay it against a fresh child rather than trusting the corpse.
+  if (turn.timedOut || turn.aborted) {
     for (const [k, c] of conversations) {
       if (c === conv) {
         destroyConversation(k);
@@ -447,12 +487,15 @@ async function handleMessages(body) {
   if (turn.stopReason === "tool_use") {
     const ids = turn.blocks.filter((b) => b.type === "tool_use").map((b) => b.id);
     const deadline = Date.now() + PARK_TIMEOUT_MS;
-    while (ids.some((id) => !conv.parked.has(id)) && Date.now() < deadline) {
+    while (ids.some((id) => !conv.parked.has(id)) && !conv.aborted && Date.now() < deadline) {
       await sleep(25);
     }
   }
 
   return turn;
+  } finally {
+    conv.busy = false;
+  }
 }
 
 // ---- wire emission ---------------------------------------------------------
@@ -591,7 +634,7 @@ const server = http.createServer(async (req, res) => {
 
     // Command Code probes with a trivial request first; answer it cheaply.
     try {
-      const turn = await handleMessages(body);
+      const turn = await handleMessages(body, res);
       emitTurn(res, conversations.get(convKey(body.model, body.system, Array.isArray(body.messages) ? body.messages : [])), turn, body.stream === true);
     } catch (e) {
       log("request failed:", e?.stack ?? e);

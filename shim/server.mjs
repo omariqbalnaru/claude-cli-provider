@@ -298,9 +298,21 @@ async function nextTurn(conv) {
   const blocks = [];
   let stopReason = null;
   let sawToolUse = false;
+  let timedOut = false;
   const deadline = Date.now() + TURN_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    const msg = await conv.q.next();
+    // The deadline is only checked between messages, so a wedged SDK child that
+    // emits nothing would block q.next() — and this request — forever. Race the
+    // wait against the remaining time explicitly.
+    const winner = await Promise.race([
+      conv.q.next().then((msg) => ({ msg })),
+      sleep(deadline - Date.now()).then(() => null),
+    ]);
+    if (!winner) {
+      timedOut = true;
+      break;
+    }
+    const msg = winner.msg;
     if (msg.__end) break;
     if (msg.type === "assistant") {
       const content = msg.message?.content;
@@ -329,7 +341,8 @@ async function nextTurn(conv) {
       break;
     }
   }
-  return { blocks, stopReason: stopReason ?? "end_turn" };
+  if (timedOut) log(`turn timed out after ${TURN_TIMEOUT_MS}ms with no SDK message`);
+  return { blocks, stopReason: stopReason ?? "end_turn", timedOut };
 }
 
 // Push an effort change to a live query. The effort option is fixed at query()
@@ -417,6 +430,18 @@ async function handleMessages(body) {
   // 3. Produce the next assistant turn.
   const turn = await nextTurn(conv);
 
+  // A turn that ended on the timeout never got a single SDK message, so the
+  // child is wedged (or gone silently); drop the conversation so the next
+  // request starts a fresh child instead of blocking on the same corpse.
+  if (turn.timedOut) {
+    for (const [k, c] of conversations) {
+      if (c === conv) {
+        destroyConversation(k);
+        break;
+      }
+    }
+  }
+
   // 4. A tool_use turn ends only once every call has parked — that is the
   //    point at which the caller can execute them and come back.
   if (turn.stopReason === "tool_use") {
@@ -445,7 +470,7 @@ function toApiBlock(b) {
 
 function emitTurn(res, conv, turn, wantStream) {
   const id = "msg_" + crypto.randomBytes(10).toString("hex");
-  const model = conv.model;
+  const model = conv?.model ?? "claude-sonnet-5";
   const content = turn.blocks
     .filter((b) => b.type === "text" || b.type === "thinking" || b.type === "tool_use")
     .map(toApiBlock)

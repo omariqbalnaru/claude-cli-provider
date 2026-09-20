@@ -249,7 +249,7 @@ async function createConversation({ system, tools, model, effort }) {
     },
   });
 
-  const conv = { q, prompt, parked, resolved, pushedUsers, sdkQuery, model: sdkModel, last: Date.now(), mcp, effort };
+  const conv = { q, prompt, parked, resolved, pushedUsers, sdkQuery, model: sdkModel, last: Date.now(), mcp, effort, pushedTotal: 0, consumedResults: 0 };
   log(`conversation created model=${sdkModel} effort=${effort ?? "(model default)"}`);
 
   (async () => {
@@ -302,6 +302,7 @@ async function nextTurn(conv) {
   let sawToolUse = false;
   let timedOut = false;
   let aborted = false;
+  let hadResult = false;
   const deadline = Date.now() + TURN_TIMEOUT_MS;
   while (Date.now() < deadline) {
     // The deadline is only checked between messages, so a wedged SDK child that
@@ -344,17 +345,30 @@ async function nextTurn(conv) {
       }
       const sr = msg.message?.stop_reason;
       if (sr) {
+        // Keep draining: the SDK ends every turn with a `result` message, and
+        // the result counter depends on seeing exactly one per user push.
         stopReason = sr;
-        break;
       }
     } else if (msg.type === "result") {
       stopReason = stopReason ?? "end_turn";
+      hadResult = true;
       break;
     }
   }
   if (timedOut) log(`turn timed out after ${TURN_TIMEOUT_MS}ms with no SDK message`);
   if (aborted) log("turn aborted by client disconnect");
-  return { blocks, stopReason: stopReason ?? "end_turn", timedOut, aborted };
+  return { blocks, stopReason: stopReason ?? "end_turn", timedOut, aborted, hadResult };
+}
+
+// A fresh child (after abort/timeout destroyed the old one) receives the whole
+// replayed user-text backlog and answers it one turn at a time; the response
+// the caller wants is the LAST one. Resolve any tool calls the stale turns
+// parked so the child keeps moving through the backlog.
+function discardParked(conv, text) {
+  for (const [id, resolve] of conv.parked) {
+    conv.parked.delete(id);
+    resolve(text);
+  }
 }
 
 // Push an effort change to a live query. The effort option is fixed at query()
@@ -385,6 +399,30 @@ async function applyEffort(conv, effort) {
   } catch (e) {
     log("effort update failed:", e?.message ?? e);
   }
+}
+
+// Render pi's message history as a single transcript prompt for a fresh
+// child. The child knows nothing (its own context died with the old
+// conversation), so the whole visible conversation is replayed in one prompt
+// and the model answers the final message in context. Blocks are capped to
+// keep a big session from costing more than it must.
+function renderTranscript(messages) {
+  const cap = (s) => (s.length > 4000 ? s.slice(0, 4000) + "…[truncated]" : s);
+  const parts = [];
+  for (const m of messages) {
+    if (!Array.isArray(m.content)) {
+      const t = textOf(m.content);
+      if (t) parts.push(`User: ${cap(t)}`);
+      continue;
+    }
+    for (const b of m.content) {
+      if (b?.type === "text") parts.push(`${m.role === "user" ? "User" : "Assistant"}: ${cap(b.text ?? "")}`);
+      else if (b?.type === "tool_use") parts.push(`Assistant called tool ${b.name} with ${cap(JSON.stringify(b.input ?? {}))}`);
+      else if (b?.type === "tool_result") parts.push(`Tool result: ${cap(toolResultText(b))}`);
+    }
+  }
+  parts.push("Continue this conversation. Respond to the most recent user message, using the conversation above as context.");
+  return parts.join("\n\n");
 }
 
 async function handleMessages(body, res) {
@@ -451,22 +489,49 @@ async function handleMessages(body, res) {
     }
   }
 
-  // 2. Push any user turn we have not fed to the query yet. A message whose
-  //    blocks are tool_results is a resolution, not a new turn.
-  for (const m of messages) {
-    if (m.role !== "user") continue;
-    if (Array.isArray(m.content) && m.content.some((b) => b?.type === "tool_result")) continue;
-    const text = textOf(m.content);
-    if (!text) continue;
-    const h = userHash(text);
-    if (conv.pushedUsers.has(h)) continue;
-    conv.pushedUsers.add(h);
-    conv.prompt.push({ type: "user", message: { role: "user", content: text } });
+  // 2. Feed user turns to the query. A fresh child knows nothing, so its
+  //    history arrives as ONE synthesized transcript prompt — re-pushing the
+  //    backlog text-by-text makes the child merge queued turns and the
+  //    result-per-push accounting drift. A live child only gets new texts.
+  const isFresh = conv.pushedTotal === 0;
+  if (isFresh) {
+    conv.prompt.push({ type: "user", message: { role: "user", content: renderTranscript(messages) } });
+    conv.pushedTotal = 1;
+    for (const m of messages) {
+      if (m.role !== "user") continue;
+      if (Array.isArray(m.content) && m.content.some((b) => b?.type === "tool_result")) continue;
+      const text = textOf(m.content);
+      if (text) conv.pushedUsers.add(userHash(text));
+    }
     conv.last = Date.now();
+  } else {
+    // A message whose blocks are tool_results is a resolution, not a new turn.
+    for (const m of messages) {
+      if (m.role !== "user") continue;
+      if (Array.isArray(m.content) && m.content.some((b) => b?.type === "tool_result")) continue;
+      const text = textOf(m.content);
+      if (!text) continue;
+      const h = userHash(text);
+      if (conv.pushedUsers.has(h)) continue;
+      conv.pushedUsers.add(h);
+      conv.pushedTotal++;
+      conv.prompt.push({ type: "user", message: { role: "user", content: text } });
+      conv.last = Date.now();
+    }
   }
 
-  // 3. Produce the next assistant turn.
-  const turn = await nextTurn(conv);
+  // 3. Produce the next assistant turn. A fresh child replaying a backlog
+  //    answers historical user texts one per turn; only the response to the
+  //    LAST push is this request's answer — discard the earlier ones.
+  let turn;
+  for (;;) {
+    turn = await nextTurn(conv);
+    if (turn.timedOut || turn.aborted) break;
+    if (turn.hadResult) conv.consumedResults++;
+    else discardParked(conv, "(tool call discarded: replayed history turn)");
+    if (conv.consumedResults >= conv.pushedTotal - 1) break;
+    log(`discarding stale replayed response (${conv.consumedResults}/${conv.pushedTotal - 1})`);
+  }
 
   // A turn that ended on the timeout never got a single SDK message, so the
   // child is wedged (or gone silently); drop the conversation so the next

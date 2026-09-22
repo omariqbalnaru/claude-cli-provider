@@ -458,17 +458,6 @@ async function nextTurn(conv) {
   return { blocks, stopReason: stopReason ?? "end_turn", timedOut, aborted, hadResult };
 }
 
-// A fresh child (after abort/timeout destroyed the old one) receives the whole
-// replayed user-text backlog and answers it one turn at a time; the response
-// the caller wants is the LAST one. Resolve any tool calls the stale turns
-// parked so the child keeps moving through the backlog.
-function discardParked(conv, text) {
-  for (const [id, resolve] of conv.parked) {
-    conv.parked.delete(id);
-    resolve(text);
-  }
-}
-
 // Render pi's message history as a single transcript prompt for a fresh
 // child. The child knows nothing (its own context died with the old
 // conversation), so the whole visible conversation is replayed in one prompt
@@ -602,7 +591,7 @@ async function handleMessages(body, res) {
     turn = await nextTurn(conv);
     if (turn.timedOut || turn.aborted) break;
     if (turn.hadResult) conv.consumedResults++;
-    else discardParked(conv, "(tool call discarded: replayed history turn)");
+    else break; // tool_use turn: its parks are live, the caller must execute them
     if (conv.consumedResults >= conv.pushedTotal - 1) break;
     log(`discarding stale replayed response (${conv.consumedResults}/${conv.pushedTotal - 1})`);
   }

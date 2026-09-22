@@ -295,6 +295,11 @@ function createConversation({ key, system, tools, model, effort }) {
     "--strict-mcp-config",
     "--mcp-config", mcpFile,
     "--setting-sources", "",
+    // Built-in tools (Bash, Read, …) must stay off: the child would execute
+    // them locally in the shim's cwd and the calls would reach pi under
+    // Claude Code's names ("Tool Bash not found"). Only the MCP bridge's
+    // tools — pi's own — are visible to the model.
+    "--tools", "",
   ];
   if (systemAppend) childArgs.push("--append-system-prompt-file", sysFile);
   if (effort) childArgs.push("--effort", effort);

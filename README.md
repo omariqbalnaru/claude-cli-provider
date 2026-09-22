@@ -108,7 +108,11 @@ bin/claude-shim     CLI
 - **Billing.** Uses your subscription quota the way interactive Claude Code
   does, because it IS Claude Code (`claude -p`). Tool calls from the harness
   are served to the child over an stdio MCP bridge and parked until the
-  harness supplies the result; effort levels fix at spawn time, so a mid-
-  conversation effort change recreates the child from the replayed history.
+  harness supplies the result; the child's built-in tools are disabled
+  (`--tools ""`) so it can only call the harness's tools — with them on, the
+  model would run commands locally in the shim's cwd under Claude Code's
+  tool names (pi then rejects them: `Tool Bash not found`). Effort levels
+  fix at spawn time, so a mid-conversation effort change recreates the child
+  from the replayed history.
   Anthropic's posture toward first-party-headless billing has changed before;
   this is a policy dependency, not a technical guarantee.

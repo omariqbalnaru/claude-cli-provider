@@ -36,6 +36,12 @@ if (argv[0] === "models") {
 
 import { MODELS, DEFAULT_PORT } from "./models.mjs";
 
+/** Catalog id → CLI model string (aliases like "opus" resolve to the latest version). */
+function cliModel(id) {
+  const entry = MODELS.find((m) => m.id === id);
+  return entry?.cli ?? id;
+}
+
 const PORT = Number(process.env.CLAUDE_SHIM_PORT ?? DEFAULT_PORT);
 const IDLE_MS = Number(process.env.CLAUDE_SHIM_IDLE_MS ?? 10 * 60 * 1000);
 const PARK_TIMEOUT_MS = Number(process.env.CLAUDE_SHIM_PARK_TIMEOUT_MS ?? 15_000);
@@ -284,13 +290,14 @@ function createConversation({ key, system, tools, model, effort }) {
   );
 
   const sdkModel = String(model ?? "").split("/").pop() || "claude-sonnet-5";
+  const childModel = cliModel(sdkModel);
 
   const childArgs = [
     "-p",
     "--input-format", "stream-json",
     "--output-format", "stream-json",
     "--verbose",
-    "--model", sdkModel,
+    "--model", childModel,
     "--permission-mode", "bypassPermissions",
     "--strict-mcp-config",
     "--mcp-config", mcpFile,

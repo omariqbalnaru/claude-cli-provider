@@ -8,6 +8,12 @@
  */
 
 export const MODELS = [
+  // Aliases — the CLI resolves these to its latest version at spawn time, so
+  // new model releases appear here with no catalog change.
+  { id: "claude-opus", name: "Claude Opus (latest)", cli: "opus", context: 1_000_000, out: 128_000 },
+  { id: "claude-sonnet", name: "Claude Sonnet (latest)", cli: "sonnet", context: 1_000_000, out: 128_000 },
+  { id: "claude-fable", name: "Claude Fable (latest)", cli: "fable", context: 1_000_000, out: 128_000 },
+  { id: "claude-haiku", name: "Claude Haiku (latest)", cli: "haiku", context: 200_000, out: 64_000 },
   { id: "claude-opus-5-5", name: "Claude Opus 5.5", context: 1_000_000, out: 128_000 },
   { id: "claude-opus-5", name: "Claude Opus 5", context: 1_000_000, out: 128_000 },
   { id: "claude-sonnet-5", name: "Claude Sonnet 5", context: 1_000_000, out: 128_000 },
@@ -25,6 +31,10 @@ export const MODELS = [
 /** Thinking efforts each model accepts, least → most intensive. */
 export const EFFORTS_BY_MODEL = {
   "claude-opus-5-5": ["low", "medium", "high", "xhigh", "max"],
+  "claude-opus": ["low", "medium", "high", "xhigh", "max"],
+  "claude-sonnet": ["low", "medium", "high", "xhigh", "max"],
+  "claude-fable": ["low", "medium", "high", "xhigh", "max"],
+  "claude-haiku": ["low", "medium", "high"],
   "claude-opus-5": ["low", "medium", "high", "xhigh", "max"],
   "claude-sonnet-5": ["low", "medium", "high", "xhigh", "max"],
   "claude-fable-5-1": ["low", "medium", "high", "xhigh", "max"],

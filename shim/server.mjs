@@ -569,6 +569,10 @@ async function handleMessages(body, res) {
     conv.last = Date.now();
   } else {
     // A message whose blocks are tool_results is a resolution, not a new turn.
+    // All new texts in one request are merged into ONE push: the CLI merges
+    // queued inputs into a single response, so one push = one result = the
+    // result-per-push accounting can't drift.
+    const newtexts = [];
     for (const m of messages) {
       if (m.role !== "user") continue;
       if (Array.isArray(m.content) && m.content.some((b) => b?.type === "tool_result")) continue;
@@ -577,8 +581,13 @@ async function handleMessages(body, res) {
       const h = userHash(text);
       if (conv.pushedUsers.has(h)) continue;
       conv.pushedUsers.add(h);
+      newtexts.push(text);
+    }
+    if (newtexts.length) {
       conv.pushedTotal++;
-      writeUserMessage(conv, text);
+      const merged = newtexts.join("\n\n");
+      log(`pushed ${newtexts.length} text(s) ${merged.length}b: ${merged.slice(0, 80)}`);
+      writeUserMessage(conv, merged);
       conv.last = Date.now();
     }
   }

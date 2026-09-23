@@ -1,12 +1,13 @@
 {
   "name": "claude-cli-provider",
   "version": "0.1.0",
-  "description": "Claude Pro/Max as a model provider for OMP, pi, and Command Code, routed through the Claude Code CLI",
+  "description": "Claude Pro/Max as a model provider for OMP, pi, Command Code, and OpenCode, routed through the Claude Code CLI",
   "type": "module",
   "license": "MIT",
   "keywords": [
     "pi-package",
     "pi-extension",
+    "opencode",
     "claude",
     "claude-code",
     "provider"

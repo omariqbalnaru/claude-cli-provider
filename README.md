@@ -1,7 +1,7 @@
 # claude-cli-provider
 
-Use a **Claude Pro/Max subscription** as a model provider in **OMP**, **pi**, and
-**Command Code** — routed through the Claude Code CLI.
+Use a **Claude Pro/Max subscription** as a model provider in **OMP**, **pi**,
+**Command Code**, and **OpenCode** — routed through the Claude Code CLI.
 
 The provider is backed by a small local server (`claude-shim`) that exposes
 Claude Code on the Anthropic Messages wire by spawning the `claude -p` CLI as a

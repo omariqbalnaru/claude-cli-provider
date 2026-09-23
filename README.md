@@ -31,6 +31,9 @@ pi install <this-package>
 
 # Command Code
 cmd mods add -g <this-package>
+
+# OpenCode — merge this block into ~/.config/opencode/opencode.json (or project opencode.json)
+claude-shim models opencode > ~/.config/opencode/opencode.json
 ```
 
 OMP and pi load `src/extension.ts` (both read the `pi.extensions` key).
@@ -55,7 +58,7 @@ claude-shim start      # boot (idempotent)
 claude-shim status     # health + model count
 claude-shim stop
 claude-shim logs                       # tail the log
-claude-shim models <fmt> [port]        # providers-json | models-yml | models-json
+claude-shim models <fmt> [port]        # providers-json | models-yml | models-json | opencode
 ```
 
 `start` installs dependencies on first run. `CLAUDE_SHIM_PORT` moves the port.

@@ -4,25 +4,13 @@
  * shared catalog (models.mjs) into each harness's hand-written config shape.
  */
 
-import { MODELS, DEFAULT_PORT } from "./models.mjs";
+import { MODELS, DEFAULT_PORT, EFFORTS_BY_MODEL } from "./models.mjs";
 
 export const PROVIDER_ID = "claude-cli";
 export const PROVIDER_NAME = "Claude (Pro/Max via claude CLI)";
 
-/** Thinking efforts each model accepts, least → most intensive. */
-export const EFFORTS_BY_MODEL = {
-  "claude-opus-5": ["low", "medium", "high", "xhigh", "max"],
-  "claude-sonnet-5": ["low", "medium", "high", "xhigh", "max"],
-  "claude-fable-5-1": ["low", "medium", "high", "xhigh", "max"],
-  "claude-fable-5": ["low", "medium", "high", "xhigh", "max"],
-  "claude-opus-4-8": ["low", "medium", "high", "xhigh", "max"],
-  "claude-opus-4-7": ["low", "medium", "high", "xhigh", "max"],
-  "claude-opus-4-6": ["low", "medium", "high", "xhigh", "max"],
-  "claude-opus-4-5": ["low", "medium", "high"],
-  "claude-sonnet-4-6": ["low", "medium", "high", "xhigh", "max"],
-  "claude-sonnet-4-5": ["low", "medium", "high"],
-  "claude-haiku-4-5": ["low", "medium", "high"],
-};
+/** Thinking efforts each model accepts — single source of truth in models.mjs. */
+export { EFFORTS_BY_MODEL };
 
 /** pi's full thinking ladder; levels a model lacks map to null. */
 const THINKING_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"];
@@ -110,5 +98,31 @@ export function render(fmt, port = DEFAULT_PORT) {
       2,
     );
   }
-  throw new Error(`unknown format: ${fmt} (expected providers-json | models-yml | models-json)`);
+  if (fmt === "opencode") {
+    // opencode (AI SDK): @ai-sdk/anthropic speaks the Anthropic Messages
+    // protocol the shim already serves, so only baseURL + model catalog differ.
+    // The shim reads the adaptive `effort` from thinking config when present;
+    // opencode users without it just get the child's model-default effort.
+    return JSON.stringify(
+      {
+        $schema: "https://opencode.ai/config.json",
+        provider: {
+          [PROVIDER_ID]: {
+            npm: "@ai-sdk/anthropic",
+            name: PROVIDER_NAME,
+            options: { baseURL: `${base}/v1`, apiKey: "claude-shim" },
+            models: Object.fromEntries(
+              MODELS.map((m) => [
+                m.id,
+                { name: m.name, limit: { context: m.context, output: m.out }, reasoning: true },
+              ]),
+            ),
+          },
+        },
+      },
+      null,
+      2,
+    );
+  }
+  throw new Error(`unknown format: ${fmt} (expected providers-json | models-yml | models-json | opencode)`);
 }

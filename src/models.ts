@@ -26,7 +26,7 @@ export const PROVIDER_ID: string = ID;
 export const PROVIDER_NAME: string = NAME;
 export const DEFAULT_PORT: number = PORT;
 
-export type ConfigFormat = "providers-json" | "models-yml" | "models-json";
+export type ConfigFormat = "providers-json" | "models-yml" | "models-json" | "opencode";
 
 export function render(fmt: ConfigFormat, port: number = DEFAULT_PORT): string {
   return (renderImpl as (f: string, p: number) => string)(fmt, port);

@@ -101,8 +101,8 @@ export function render(fmt, port = DEFAULT_PORT) {
   if (fmt === "opencode") {
     // opencode (AI SDK): @ai-sdk/anthropic speaks the Anthropic Messages
     // protocol the shim already serves, so only baseURL + model catalog differ.
-    // The shim reads the adaptive `effort` from thinking config when present;
-    // opencode users without it just get the child's model-default effort.
+    // opencode has no thinking API, so each model also gets `:effort` variants
+    // (the shim strips the suffix and passes it as the CLI's --effort).
     return JSON.stringify(
       {
         $schema: "https://opencode.ai/config.json",
@@ -112,9 +112,12 @@ export function render(fmt, port = DEFAULT_PORT) {
             name: PROVIDER_NAME,
             options: { baseURL: `${base}/v1`, apiKey: "claude-shim" },
             models: Object.fromEntries(
-              MODELS.map((m) => [
-                m.id,
-                { name: m.name, limit: { context: m.context, output: m.out }, reasoning: true },
+              MODELS.flatMap((m) => [
+                [m.id, { name: m.name, limit: { context: m.context, output: m.out }, reasoning: true }],
+                ...effortsFor(m.id).map((e) => [
+                  `${m.id}:${e}`,
+                  { name: `${m.name} (${e} effort)`, limit: { context: m.context, output: m.out }, reasoning: true },
+                ]),
               ]),
             ),
           },

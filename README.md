@@ -90,6 +90,11 @@ bin/claude-shim     CLI
 
 ## Notes
 
+- **Effort via model-id suffix.** Any client can append `:low`…`:max` to a model
+  id (`claude-opus-5-5:high`) — the shim strips it and passes it as the CLI's
+  `--effort`. opencode, which has no thinking API, gets ready-made effort
+  variants in its picker via `claude-shim models opencode`.
+
 - **Thinking levels differ per harness.** OMP reads `thinking: {mode, efforts}`;
   pi reads `thinkingLevelMap` (plus `compat.forceAdaptiveThinking`). The
   registered provider emits all three, so the thinking menu matches what the

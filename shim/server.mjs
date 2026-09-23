@@ -493,10 +493,17 @@ async function handleMessages(body, res) {
   const messages = Array.isArray(body.messages) ? body.messages : [];
   const key = convKey(body.model, body.system, messages);
 
+  // Model ids may carry an effort suffix (`claude-opus-5-5:high`) — lets clients
+  // with no thinking API (e.g. opencode) pick effort as if it were a model.
+  const suffixMatch = String(body.model ?? "").match(/^(.*):(low|medium|high|xhigh|max)$/);
+  if (suffixMatch) body.model = suffixMatch[1];
+
   // Anthropic's wire name for the reasoning level; older bodies nest it under
   // `output_config`. Accept either so a version bump cannot silently drop it.
   const requestedEffort =
-    normalizeEffort(body.effort) ?? normalizeEffort(body.output_config?.effort);
+    normalizeEffort(suffixMatch?.[2]) ??
+    normalizeEffort(body.effort) ??
+    normalizeEffort(body.output_config?.effort);
 
   let conv = conversations.get(key);
   if (conv && requestedEffort && conv.effort && requestedEffort !== conv.effort) {

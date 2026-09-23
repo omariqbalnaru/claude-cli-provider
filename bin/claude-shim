@@ -5,10 +5,11 @@
 #   claude-shim stop      shut it down
 #   claude-shim status    health + model count
 #   claude-shim logs      tail its log
-#   claude-shim models <providers-json|models-yml|models-json> [port]
+#   claude-shim models <providers-json|models-yml|models-json|opencode> [port]
 #                         render this catalog as a harness config
 #
-# Auth comes from Claude Code's own Keychain entry via the official Agent SDK.
+# Auth comes from Claude Code's own Keychain entry — the shim spawns the
+# official `claude` CLI, which owns authentication.
 # This never reads, extracts, or replays an OAuth token.
 set -euo pipefail
 
@@ -85,7 +86,7 @@ case "${1:-start}" in
     tail -n 40 -f "$LOG"
     ;;
   *)
-    echo "usage: claude-shim {start|stop|status|logs|models <fmt> [port]}" >&2
+    echo "usage: claude-shim {start|stop|status|logs|models <providers-json|models-yml|models-json|opencode> [port]}" >&2
     exit 2
     ;;
 esac

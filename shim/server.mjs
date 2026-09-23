@@ -328,7 +328,7 @@ function createConversation({ key, system, tools, model, effort }) {
 
   const conv = {
     q, child, parked, resolved, pushedUsers, model: sdkModel, effort,
-    last: Date.now(), tempDir, pushedTotal: 0, consumedResults: 0,
+    last: Date.now(), tempDir, pushedTotal: 0, consumedResults: 0, seenUserTexts: 0,
     busy: false, aborted: false, _abortWait: null,
   };
   log(`conversation created model=${sdkModel} effort=${effort ?? "(model default)"}`);
@@ -491,12 +491,15 @@ function renderTranscript(messages) {
 
 async function handleMessages(body, res) {
   const messages = Array.isArray(body.messages) ? body.messages : [];
-  const key = convKey(body.model, body.system, messages);
 
   // Model ids may carry an effort suffix (`claude-opus-5-5:high`) — lets clients
   // with no thinking API (e.g. opencode) pick effort as if it were a model.
+  // Strip it BEFORE the conversation key: the suffixed and base ids are the
+  // same conversation, and hashing the raw id keyed a fresh one per effort.
   const suffixMatch = String(body.model ?? "").match(/^(.*):(low|medium|high|xhigh|max)$/);
   if (suffixMatch) body.model = suffixMatch[1];
+
+  const key = convKey(body.model, body.system, messages);
 
   // Anthropic's wire name for the reasoning level; older bodies nest it under
   // `output_config`. Accept either so a version bump cannot silently drop it.
@@ -506,9 +509,12 @@ async function handleMessages(body, res) {
     normalizeEffort(body.output_config?.effort);
 
   let conv = conversations.get(key);
-  if (conv && requestedEffort && conv.effort && requestedEffort !== conv.effort) {
-    // The CLI fixes --effort at spawn time. pi always replays the full history,
-    // so a fresh child reconstructed from the transcript loses nothing.
+  // The CLI fixes --effort at spawn time. Recreate whenever a requested effort
+  // differs from the child's spawn-fixed one — including when the child has
+  // none yet (started via a base id, now an :effort variant was picked). A
+  // request carrying no effort keeps the child as-is (pi replays the full
+  // history, so a fresh child reconstructed from the transcript loses nothing).
+  if (conv && requestedEffort && requestedEffort !== conv.effort) {
     log(`effort change ${conv.effort} -> ${requestedEffort}; recreating conversation`);
     destroyConversation(key);
     conv = undefined;
@@ -570,33 +576,42 @@ async function handleMessages(body, res) {
   //    history arrives as ONE synthesized transcript prompt — re-pushing the
   //    backlog text-by-text makes the child merge queued turns and the
   //    result-per-push accounting drift. A live child only gets new texts.
+  // A user message whose blocks are tool_results is a resolution, not a turn.
+  const userTexts = [];
+  for (const m of messages) {
+    if (m.role !== "user") continue;
+    if (Array.isArray(m.content) && m.content.some((b) => b?.type === "tool_result")) continue;
+    const text = textOf(m.content);
+    if (text) userTexts.push(text);
+  }
   const isFresh = conv.pushedTotal === 0;
   if (isFresh) {
     writeUserMessage(conv, renderTranscript(messages));
     conv.pushedTotal = 1;
-    for (const m of messages) {
-      if (m.role !== "user") continue;
-      if (Array.isArray(m.content) && m.content.some((b) => b?.type === "tool_result")) continue;
-      const text = textOf(m.content);
-      if (text) conv.pushedUsers.add(userHash(text));
-    }
+    for (const t of userTexts) conv.pushedUsers.add(userHash(t));
+    conv.seenUserTexts = userTexts.length;
     conv.last = Date.now();
   } else {
-    // A message whose blocks are tool_results is a resolution, not a new turn.
+    // Newness is positional, not by content: the caller replays an append-only
+    // history, so the first seenUserTexts user-text messages were already fed
+    // and everything after them is new — even a text that repeats an earlier
+    // one verbatim (hash-dedupe silently dropped those, leaving the turn
+    // hanging until TURN_TIMEOUT_MS and the conversation destroyed). The hash
+    // set only serves the rewrite fallback: if the history SHRANK, the caller
+    // compacted it, positions no longer align, and only content can identify
+    // what is new.
+    let newtexts;
+    if (userTexts.length >= conv.seenUserTexts) {
+      newtexts = userTexts.slice(conv.seenUserTexts);
+    } else {
+      log(`history shrank (${userTexts.length} < ${conv.seenUserTexts} texts); deduping by content`);
+      newtexts = userTexts.filter((t) => !conv.pushedUsers.has(userHash(t)));
+    }
+    for (const t of newtexts) conv.pushedUsers.add(userHash(t));
+    conv.seenUserTexts = userTexts.length;
     // All new texts in one request are merged into ONE push: the CLI merges
     // queued inputs into a single response, so one push = one result = the
     // result-per-push accounting can't drift.
-    const newtexts = [];
-    for (const m of messages) {
-      if (m.role !== "user") continue;
-      if (Array.isArray(m.content) && m.content.some((b) => b?.type === "tool_result")) continue;
-      const text = textOf(m.content);
-      if (!text) continue;
-      const h = userHash(text);
-      if (conv.pushedUsers.has(h)) continue;
-      conv.pushedUsers.add(h);
-      newtexts.push(text);
-    }
     if (newtexts.length) {
       conv.pushedTotal++;
       const merged = newtexts.join("\n\n");
@@ -643,7 +658,7 @@ async function handleMessages(body, res) {
     }
   }
 
-  return turn;
+  return { conv, turn };
   } finally {
     conv.busy = false;
   }
@@ -802,8 +817,11 @@ const server = http.createServer(async (req, res) => {
       }, 10_000);
     }
     try {
-      const turn = await handleMessages(body, res);
-      emitTurn(res, conversations.get(convKey(body.model, body.system, Array.isArray(body.messages) ? body.messages : [])), turn, wantStream);
+      // handleMessages already resolved (or created) the conversation; pass it
+      // through instead of re-hashing the key, so the emitter can't drift from
+      // the conversation the turn actually ran on.
+      const { conv, turn } = await handleMessages(body, res);
+      emitTurn(res, conv, turn, wantStream);
     } catch (e) {
       log("request failed:", e?.stack ?? e);
       if (!res.headersSent) {

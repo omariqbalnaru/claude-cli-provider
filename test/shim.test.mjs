@@ -35,6 +35,7 @@ rl.on("line", async (line) => {
     process.exit(1);
   }
   if (text.includes("ENV")) return say(Object.keys(process.env).join(","));
+  if (text.includes("PID")) return say("pid " + process.pid);
   if (text.includes("ARGS")) return say(JSON.stringify({ argv: process.argv.slice(2), cwd: process.cwd(), files: fs.readdirSync(process.cwd()), memory: process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY }));
   if (text.includes("FAIL")) {
     out({ type: "assistant", error: "rate_limit", message: { model: "<synthetic>", content: [{ type: "text", text: "usage limit hit" }], stop_reason: "stop_sequence" } });
@@ -42,6 +43,7 @@ rl.on("line", async (line) => {
   }
   if (text.includes("TOOL") && !text.includes("Tool result")) {
     out({ type: "assistant", message: { content: [{ type: "tool_use", id: "toolu_1", name: "mcp__cctools__echo", input: {} }] } });
+    out({ type: "stream_event", event: { type: "message_stop" } });
     inTool = true;
     const r = await fetch("http://127.0.0.1:" + bridge.CLAUDE_BRIDGE_PORT + "/internal/toolcall", {
       method: "POST", body: JSON.stringify({ conv: bridge.CLAUDE_BRIDGE_CONV, id: "toolu_1" }),
@@ -201,4 +203,34 @@ test("an identical resend rebuilds instead of waiting on an idle child", async (
 test("user images reach the child as image blocks", async () => {
   const r = await request(msgs(user([{ type: "text", text: "look" }, { type: "image", source: IMG }])));
   assert.match(text(r), /"type":"image","source":\{"type":"base64","media_type":"image\/png"/);
+});
+
+test("pi context-mode: a per-request note that vanishes later does not rebuild", async () => {
+  // Captured from pi with the context-mode extension: request 1 has the
+  // prompt plus an injected note; request 2 drops the note.
+  const prompt = user("TOOL ctx");
+  const r1 = JSON.parse((await request(msgs(prompt, user("context-mode active. Hierarchy: …")))).data);
+  assert.equal(r1.stop_reason, "tool_use");
+  const r2 = await request(msgs(prompt, { role: "assistant", content: r1.content }, user([{ type: "tool_result", tool_use_id: "toolu_1", content: "out" }])));
+  assert.match(text(r2), /^echo: |tool said: out/);
+  assert.doesNotMatch(text(r2), /Continue this conversation/);
+});
+
+test("a <system-reminder> block that changes between requests does not rebuild", async () => {
+  const first = user([{ type: "text", text: "<system-reminder>Today: day 1</system-reminder>" }, { type: "text", text: "alpha reminder" }]);
+  const r1 = JSON.parse((await request(msgs(first))).data);
+  const later = user([{ type: "text", text: "<system-reminder>Today: day 2</system-reminder>" }, { type: "text", text: "alpha reminder" }]);
+  const r2 = text(await request(msgs(later, { role: "assistant", content: r1.content }, user("beta reminder"))));
+  assert.match(r2, /echo: \[\{"type":"text","text":"beta reminder"\}\]/);
+});
+
+test("the same opening in two sessions gets two children", async () => {
+  const opening = msgs(user("PID session"));
+  const s1 = { "x-claude-code-session-id": "s-1" };
+  const a = JSON.parse((await request(opening, s1)).data);
+  const b = JSON.parse((await request(opening, { "x-claude-code-session-id": "s-2" })).data);
+  assert.notEqual(a.content[0].text, b.content[0].text);
+  // Session 1 is still on its own live child.
+  const again = JSON.parse((await request(msgs(user("PID session"), { role: "assistant", content: a.content }, user("PID again")), s1)).data);
+  assert.equal(again.content[0].text, a.content[0].text);
 });

@@ -44,7 +44,6 @@ function cliModel(id) {
 
 const PORT = Number(process.env.CLAUDE_SHIM_PORT ?? DEFAULT_PORT);
 const IDLE_MS = Number(process.env.CLAUDE_SHIM_IDLE_MS ?? 10 * 60 * 1000);
-const PARK_TIMEOUT_MS = Number(process.env.CLAUDE_SHIM_PARK_TIMEOUT_MS ?? 15_000);
 const TURN_TIMEOUT_MS = Number(process.env.CLAUDE_SHIM_TURN_TIMEOUT_MS ?? 15 * 60 * 1000);
 
 const MCP_SERVER_NAME = "cctools";
@@ -101,23 +100,34 @@ function stableSystem(system) {
     .join("\n\n");
 }
 
-// The wire carries no session id, so a conversation is identified by its
-// opening turn: model + system prompt + first real user message. Every later
-// request in the same conversation replays a history that still starts with
-// that message, so the key stays stable. The model is part of the key because
-// one harness can address several models with the same opening message;
-// without it the second model's turn would be routed onto the first model's
-// live session.
-function convKey(model, system, messages) {
-  const firstUser = messages.find((m) => m.role === "user" && textOf(m.content));
+// A conversation is identified by its opening turn: model + system prompt +
+// first real user message. Every later request in the same conversation
+// replays a history that still starts with that message, so the key stays
+// stable. The model is part of the key because one harness can address
+// several models with the same opening message. A session id, when the client
+// sends one (OMP: x-claude-code-session-id; pi: x-session-affinity), keeps two
+// sessions with the same opening apart; it is added to the content key, not
+// used alone, so a side request in the same session (a compaction summary, a
+// title) gets its own child instead of thrashing the main one.
+function convKey(model, system, messages, sessionId) {
+  const firstUser = messages.find((m) => m.role === "user" && ownText(m.content));
   return crypto
     .createHash("sha1")
     .update(String(model ?? ""))
     .update("\u0000")
     .update(stableSystem(system))
     .update("\u0000")
-    .update(textOf(firstUser?.content ?? ""))
+    .update(ownText(firstUser?.content))
+    .update("\u0000")
+    .update(String(sessionId ?? ""))
     .digest("hex");
+}
+
+// A user message's own text, minus <system-reminder> blocks: harnesses put
+// per-request context there (OMP's date and cwd, OpenCode's mode notes), and
+// it must not make the same message look different between requests.
+function ownText(content) {
+  return textOf(userBlocks(content).filter((b) => b.type === "text" && !b.text.trimStart().startsWith("<system-reminder>")));
 }
 
 // A user message's own input as Anthropic blocks: text and images, minus
@@ -206,6 +216,15 @@ async function handleInternalToolcall(req, res) {
     return;
   }
   const id = String(body.id ?? "");
+  // The CLI runs MCP calls one at a time, so the caller's result for a later
+  // call of the same message usually arrives before the call does.
+  if (conv.early.has(id)) {
+    const reply = conv.early.get(id);
+    conv.early.delete(id);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(reply));
+    return;
+  }
   let bridgeGone = false;
   // Resolves with { content, isError } for a real result, { text } otherwise.
   const reply = await new Promise((resolve) => {
@@ -271,6 +290,7 @@ const strippedEnv = (k) => STRIPPED_ENV.includes(k) || k.startsWith("ANTHROPIC_"
 function createConversation({ key, system, tools, model, effort }) {
   const q = makeQueue();
   const parked = new Map(); // toolUseId -> resolve({ content, isError } | { text })
+  const early = new Map(); // toolUseId -> reply that arrived before its call
 
   const tempDir = mkdtempSync(join(tmpdir(), "claude-shim-conv-"));
   const defs = (tools ?? [])
@@ -331,6 +351,9 @@ function createConversation({ key, system, tools, model, effort }) {
     // so writing each one — system prompt, tool outputs and all — under
     // ~/.claude/projects is pure exposure.
     "--no-session-persistence",
+    // Stream events mark where each model message ends, so a tool_use turn can
+    // return every parallel call of the message, not only the first.
+    "--include-partial-messages",
   ];
   if (systemAppend) childArgs.push("--append-system-prompt-file", sysFile);
   if (effort) childArgs.push("--effort", effort);
@@ -342,7 +365,9 @@ function createConversation({ key, system, tools, model, effort }) {
   env.SHELL = env.SHELL || "/bin/sh";
   env.TMPDIR = env.TMPDIR || "/tmp";
   env.HOME = env.HOME || tmpdir();
-  env.DISABLE_AUTO_COMPACT = "1";
+  // No DISABLE_AUTO_COMPACT: with it the child can neither compact nor recover
+  // from prompt-too-long, and a caller that compacts on its own schedule may
+  // not get there first (e.g. it thinks the window is bigger than it is).
   // Auto-memory would have the model keep notes in one directory shared by
   // every client and project (and --setting-sources "" hides a user's own
   // opt-out).
@@ -361,7 +386,7 @@ function createConversation({ key, system, tools, model, effort }) {
   });
 
   const conv = {
-    q, child, parked, model: sdkModel, effort, last: Date.now(), tempDir,
+    q, child, parked, early, model: sdkModel, effort, last: Date.now(), tempDir,
     record: [], // fingerprints of the history the child has seen, reply included
     pending: [], // tool_use ids of the last reply, awaiting the caller's results
     busy: false, aborted: false, _abortWait: null,
@@ -419,6 +444,7 @@ function destroyConversation(key) {
   conv._abortWait = null;
   for (const resolve of conv.parked.values()) resolve({ text: "(tool call aborted: session ended)" });
   conv.parked.clear();
+  conv.early.clear();
   try {
     conv.child.stdin.end();
   } catch {}
@@ -468,6 +494,7 @@ async function nextTurn(conv) {
   let hadResult = false;
   let ended = false;
   let error = null; // CLI-reported API failure: { kind, message }
+  let usage = null; // the last model call's, as the CLI reports it
   const deadline = Date.now() + TURN_TIMEOUT_MS;
   while (Date.now() < deadline) {
     // The deadline is only checked between messages, so a wedged child that
@@ -507,8 +534,20 @@ async function nextTurn(conv) {
       else error = { kind: msg.error, message: textOf(msg.message?.content) || msg.error };
       continue;
     }
+    // A tool_use turn ends with its model message, not with a result: once
+    // the calls park, the child blocks inside them and emits nothing more.
+    // The CLI sends one assistant event per block, all before message_stop,
+    // so every parallel call of the message is in by then.
+    if (msg.type === "stream_event") {
+      // message_delta carries the model call's final output count; the
+      // per-block assistant events only have the count so far.
+      if (msg.event?.type === "message_delta" && msg.event.usage) usage = { ...usage, ...msg.event.usage };
+      if (sawToolUse && msg.event?.type === "message_stop") break;
+      continue;
+    }
     if (msg.type === "assistant") {
       const content = msg.message?.content;
+      if (msg.message?.usage) usage = msg.message.usage;
       if (Array.isArray(content)) {
         for (const b of content) {
           // Replaying thinking blocks requires a signature Anthropic can verify.
@@ -517,12 +556,9 @@ async function nextTurn(conv) {
           if (b.type === "tool_use") sawToolUse = true;
         }
       }
-      // A tool_use turn must end on the tool_use block, not on stop_reason:
-      // once a call parks, the child blocks inside the tool and never emits a
-      // result, so waiting for one would deadlock the request.
       if (sawToolUse) {
         stopReason = "tool_use";
-        break;
+        continue;
       }
       const sr = msg.message?.stop_reason;
       if (sr) {
@@ -548,7 +584,7 @@ async function nextTurn(conv) {
   if (timedOut) log(`turn timed out after ${TURN_TIMEOUT_MS}ms with no child message`);
   if (aborted) log("turn aborted (client disconnect or conversation teardown)");
   if (error) log(`turn failed: ${error.kind}: ${error.message.slice(0, 200)}`);
-  return { blocks, stopReason: stopReason ?? "end_turn", timedOut, aborted, hadResult, ended, error };
+  return { blocks, stopReason: stopReason ?? "end_turn", timedOut, aborted, hadResult, ended, error, usage };
 }
 
 // Render the caller's history as ONE prompt for a fresh child. The child knows
@@ -595,7 +631,7 @@ function fingerprint(m) {
   const blocks = Array.isArray(m?.content) ? m.content : [];
   if (m?.role === "assistant") return "a:" + blocks.filter((b) => b?.type === "tool_use").map((b) => b.id).join(",");
   const results = blocks.filter((b) => b?.type === "tool_result").map((b) => b.tool_use_id).join(",");
-  return `${m?.role}:${sha1(textOf(userBlocks(m?.content)))}:${results}`;
+  return `${m?.role}:${sha1(ownText(m?.content))}:${results}`;
 }
 
 // How a request continues the live child, or { reason } it cannot. It must
@@ -605,11 +641,19 @@ function fingerprint(m) {
 // user input.
 function continuation(conv, messages, fps) {
   if (conv.q.stale()) return { reason: "child produced a reply nobody requested" };
-  const seen = conv.record;
-  const at = seen.findIndex((fp, i) => fps[i] !== fp);
-  if (at >= 0) return { reason: `history diverged at message ${at} (${seen[at].slice(0, 12)} vs ${String(fps[at]).slice(0, 12)})` };
-  const tail = messages.slice(seen.length);
-  if (!tail.length) return { reason: `nothing new past the ${seen.length} messages the child has seen` };
+  // Walk what the child has seen against the request. A text-only user
+  // message it saw may be missing now: extensions add per-request context
+  // after the latest prompt and leave it out of later requests (pi's
+  // context-mode). Anything else must line up exactly.
+  let j = 0;
+  for (const fp of conv.record) {
+    if (fps[j] === fp) j++;
+    else if (!/^user:[0-9a-f]+:$/.test(fp)) {
+      return { reason: `history diverged at message ${j} (${fp.slice(0, 12)} vs ${String(fps[j]).slice(0, 12)})` };
+    }
+  }
+  const tail = messages.slice(j);
+  if (!tail.length) return { reason: `nothing new past the ${j} messages the child has seen` };
   const other = tail.find((m) => m.role !== "user");
   if (other) return { reason: `new ${other.role} message the child did not produce` };
   const results = tail.flatMap((m) => (Array.isArray(m.content) ? m.content.filter((b) => b?.type === "tool_result") : []));
@@ -617,7 +661,6 @@ function continuation(conv, messages, fps) {
   const answered = results.map((b) => b.tool_use_id).sort().join(",");
   if (conv.pending.length) {
     if (answered !== [...conv.pending].sort().join(",")) return { reason: `tool results [${answered}] do not answer pending [${conv.pending}]` };
-    if (conv.pending.some((id) => !conv.parked.has(id))) return { reason: "a pending tool call never reached the bridge" };
   } else if (results.length) {
     return { reason: "tool results for calls the child is not waiting on" };
   } else if (!input.length) {
@@ -626,7 +669,7 @@ function continuation(conv, messages, fps) {
   return { results, input };
 }
 
-async function handleMessages(body, res) {
+async function handleMessages(body, res, headers = {}) {
   const messages = Array.isArray(body.messages) ? body.messages : [];
 
   // Model ids may carry an effort suffix (`claude-opus-5-5:high`) — lets clients
@@ -636,7 +679,8 @@ async function handleMessages(body, res) {
   const suffixMatch = String(body.model ?? "").match(/^(.*):(low|medium|high|xhigh|max)$/);
   if (suffixMatch) body.model = suffixMatch[1];
 
-  const key = convKey(body.model, body.system, messages);
+  const sessionId = headers["x-claude-code-session-id"] ?? headers["x-session-affinity"] ?? headers["x-session-id"];
+  const key = convKey(body.model, body.system, messages, sessionId);
 
   // Anthropic's wire name for the reasoning level; older bodies nest it under
   // `output_config`. Accept either so a version bump cannot silently drop it.
@@ -719,9 +763,11 @@ async function handleMessages(body, res) {
         writeUserMessage(conv, plan.input);
       }
       for (const b of plan.results) {
+        const reply = { content: toolResultBlocks(b), isError: b.is_error === true };
         const resolve = conv.parked.get(b.tool_use_id);
         conv.parked.delete(b.tool_use_id);
-        resolve({ content: toolResultBlocks(b), isError: b.is_error === true });
+        if (resolve) resolve(reply);
+        else conv.early.set(b.tool_use_id, reply); // its call has not reached the bridge yet
       }
     } else {
       log(`pushed ${plan.input.length} block(s), ${textOf(plan.input).length} chars`);
@@ -748,13 +794,6 @@ async function handleMessages(body, res) {
     const calls = turn.blocks.filter((b) => b.type === "tool_use").map((b) => b.id);
     conv.record = [...fps, fingerprint({ role: "assistant", content: turn.blocks })];
     conv.pending = calls;
-
-    // 3. A tool_use turn ends only once every call has parked — that is the
-    //    point at which the caller can execute them and come back.
-    const deadline = Date.now() + PARK_TIMEOUT_MS;
-    while (calls.some((id) => !conv.parked.has(id)) && !conv.aborted && Date.now() < deadline) {
-      await sleep(25);
-    }
     return { conv, turn };
   } catch (e) {
     // The caller stores no reply for a failed turn, so the child is ahead of
@@ -781,6 +820,16 @@ function toApiBlock(b) {
 
 function emitTurn(res, conv, turn, wantStream) {
   const id = "msg_" + crypto.randomBytes(10).toString("hex");
+  // Real token counts, so the caller's context accounting (and its decision
+  // to compact) sees the child's actual prompt size, CLI system prompt and
+  // tool definitions included.
+  const u = turn.usage ?? {};
+  const usage = {
+    input_tokens: u.input_tokens ?? 0,
+    cache_creation_input_tokens: u.cache_creation_input_tokens ?? 0,
+    cache_read_input_tokens: u.cache_read_input_tokens ?? 0,
+    output_tokens: u.output_tokens ?? 0,
+  };
   const model = conv?.model ?? "claude-sonnet-5";
   const content = turn.blocks
     .filter((b) => b.type === "text" || b.type === "thinking" || b.type === "tool_use")
@@ -798,7 +847,7 @@ function emitTurn(res, conv, turn, wantStream) {
         content,
         stop_reason: turn.stopReason,
         stop_sequence: null,
-        usage: { input_tokens: 0, output_tokens: 0 },
+        usage,
       }),
     );
     return;
@@ -824,7 +873,7 @@ function emitTurn(res, conv, turn, wantStream) {
       content: [],
       stop_reason: null,
       stop_sequence: null,
-      usage: { input_tokens: 0, output_tokens: 0 },
+      usage: { ...usage, output_tokens: 0 },
     },
   });
 
@@ -849,7 +898,7 @@ function emitTurn(res, conv, turn, wantStream) {
     }
   }
 
-  sse("message_delta", { type: "message_delta", delta: { stop_reason: turn.stopReason, stop_sequence: null }, usage: { output_tokens: 0 } });
+  sse("message_delta", { type: "message_delta", delta: { stop_reason: turn.stopReason, stop_sequence: null }, usage });
   sse("message_stop", { type: "message_stop" });
   res.end();
 }
@@ -970,7 +1019,7 @@ const server = http.createServer(async (req, res) => {
       // handleMessages already resolved (or created) the conversation; pass it
       // through instead of re-hashing the key, so the emitter can't drift from
       // the conversation the turn actually ran on.
-      const { conv, turn } = await handleMessages(body, res);
+      const { conv, turn } = await handleMessages(body, res, req.headers);
       emitTurn(res, conv, turn, wantStream);
     } catch (e) {
       log("request failed:", e?.stack ?? e);

@@ -97,12 +97,23 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       ]),
       // The shim sends an adaptive `effort`, not a token budget; without this
       // pi emits thinkingBudgetTokens and the effort never reaches the wire.
-      compat: { forceAdaptiveThinking: true },
+      // sendSessionAffinityHeaders: pi then sends x-session-affinity, which
+      // keeps two sessions with the same opening message on separate children.
+      compat: { forceAdaptiveThinking: true, sendSessionAffinityHeaders: true },
     })),
   } as Parameters<ExtensionAPI["registerProvider"]>[1]);
 
   pi.on("session_start", async () => {
     if (!(await shimUp())) bootShim();
+  });
+
+  // A shim that died mid-session (crash, OOM, `claude-shim stop`, a deploy)
+  // would otherwise stay down until the next session: re-check before each
+  // agent run and wait briefly for a fresh boot to listen.
+  pi.on("before_agent_start", async () => {
+    if (await shimUp()) return;
+    bootShim();
+    for (let i = 0; i < 20 && !(await shimUp()); i++) await new Promise((r) => setTimeout(r, 250));
   });
 }
 

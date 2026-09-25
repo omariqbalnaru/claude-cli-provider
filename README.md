@@ -63,13 +63,15 @@ claude-shim logs                       # tail the log
 claude-shim models <fmt> [port]        # providers-json | models-yml | models-json | opencode
 ```
 
-`start` installs dependencies on first run. `CLAUDE_SHIM_PORT` moves the port.
+`CLAUDE_SHIM_PORT` moves the port.
 
 ## Requirements
 
 - `claude` on `PATH`, authenticated with a Pro/Max subscription
-  (`npm install -g @anthropic-ai/claude-code`)
-- Node 22+
+  (`npm install -g @anthropic-ai/claude-code`). Tested with 2.1.282; the shim
+  relies on `--include-partial-messages`, `--disable-slash-commands` and
+  `--no-session-persistence`, so older CLIs will not work.
+- Node 22+ (the shim runs under node even when the harness runs on bun)
 
 ## Model catalog
 

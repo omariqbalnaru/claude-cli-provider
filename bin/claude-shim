@@ -41,13 +41,6 @@ case "${1:-start}" in
       echo "claude-shim already listening on :$PORT"
       exit 0
     fi
-    if [ ! -d "$SHIM_DIR/../node_modules" ]; then
-      echo "installing dependencies..." >&2
-      (cd "$SHIM_DIR/.." && npm install --omit=dev --ignore-scripts >/dev/null 2>&1) || {
-        echo "dependency install failed; run 'npm install' in $SHIM_DIR/.." >&2
-        exit 1
-      }
-    fi
     echo "starting claude-shim on :$PORT ..."
     # Detach with a real login environment (Keychain auth needs it), and keep
     # the log private: the shim logs conversation metadata.

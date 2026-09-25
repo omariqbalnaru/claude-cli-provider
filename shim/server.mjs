@@ -49,7 +49,6 @@ const TURN_TIMEOUT_MS = Number(process.env.CLAUDE_SHIM_TURN_TIMEOUT_MS ?? 15 * 6
 
 const MCP_SERVER_NAME = "cctools";
 const MCP_PREFIX = `mcp__${MCP_SERVER_NAME}__`;
-const TOOL_USE_ID_META = "claudecode/toolUseId";
 
 const log = (...a) => console.error("[claude-shim]", new Date().toISOString().slice(11, 23), ...a);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -121,23 +120,26 @@ function convKey(model, system, messages) {
     .digest("hex");
 }
 
-function userHash(text) {
-  return crypto.createHash("sha1").update(text).digest("hex");
+// A user message's own input as Anthropic blocks: text and images, minus
+// tool_results and client-side extras like cache_control.
+function userBlocks(content) {
+  if (typeof content === "string") return content ? [{ type: "text", text: content }] : [];
+  if (!Array.isArray(content)) return [];
+  return content.flatMap((b) =>
+    b?.type === "text" && b.text ? [{ type: "text", text: b.text }]
+    : b?.type === "image" && b.source ? [{ type: "image", source: b.source }]
+    : [],
+  );
 }
 
-function toolResultText(block) {
+// A tool_result's content as Anthropic blocks (text + images), never empty.
+function toolResultBlocks(block) {
   const c = block.content;
-  let text =
-    typeof c === "string"
-      ? c
-      : Array.isArray(c)
-        ? c
-            .map((x) => (x?.type === "text" ? x.text ?? "" : `[${x?.type ?? "block"}]`))
-            .join("\n")
-        : "";
-  if (!text) text = "(no output)";
-  if (block.is_error) text = `ERROR: ${text}`;
-  return text;
+  const blocks =
+    typeof c === "string" ? [{ type: "text", text: c }]
+    : Array.isArray(c) ? c.map((x) => (x?.type === "image" ? { type: "image", source: x.source } : { type: "text", text: x?.text ?? `[${x?.type ?? "block"}]` }))
+    : [];
+  return blocks.some((b) => b.type === "image" || b.text) ? blocks : [{ type: "text", text: "(no output)" }];
 }
 
 function stripMcp(name) {
@@ -156,6 +158,11 @@ function makeQueue() {
     end() {
       ended = true;
       while (waiters.length) waiters.shift()({ __end: true });
+    },
+    // A reply sitting unread means the child answered something nobody is
+    // waiting for (input queued instead of folded); its turns no longer line up.
+    stale() {
+      return items.some((m) => m.type === "assistant" || m.type === "result");
     },
     async next() {
       if (items.length) return items.shift();
@@ -200,20 +207,21 @@ async function handleInternalToolcall(req, res) {
   }
   const id = String(body.id ?? "");
   let bridgeGone = false;
-  const text = await new Promise((resolve) => {
+  // Resolves with { content, isError } for a real result, { text } otherwise.
+  const reply = await new Promise((resolve) => {
     conv.parked.set(id, resolve);
     req.on("close", () => {
       // The bridge child died (conversation teardown kills the whole tree).
       if (conv.parked.get(id) === resolve) {
         conv.parked.delete(id);
         bridgeGone = true;
-        resolve("(tool call aborted: bridge disconnected)");
+        resolve({ text: "(tool call aborted: bridge disconnected)" });
       }
     });
   });
   if (bridgeGone) return;
   res.writeHead(200, { "content-type": "application/json" });
-  res.end(JSON.stringify({ text }));
+  res.end(JSON.stringify(reply));
 }
 
 // Random-port loopback listener the MCP bridges talk to. Bound before the
@@ -262,9 +270,7 @@ const strippedEnv = (k) => STRIPPED_ENV.includes(k) || k.startsWith("ANTHROPIC_"
 
 function createConversation({ key, system, tools, model, effort }) {
   const q = makeQueue();
-  const parked = new Map(); // toolUseId -> resolve(text)
-  const resolved = new Set();
-  const pushedUsers = new Set();
+  const parked = new Map(); // toolUseId -> resolve({ content, isError } | { text })
 
   const tempDir = mkdtempSync(join(tmpdir(), "claude-shim-conv-"));
   const defs = (tools ?? [])
@@ -336,8 +342,9 @@ function createConversation({ key, system, tools, model, effort }) {
   });
 
   const conv = {
-    q, child, parked, resolved, pushedUsers, model: sdkModel, effort,
-    last: Date.now(), tempDir, pushedTotal: 0, consumedResults: 0, seenUserTexts: 0,
+    q, child, parked, model: sdkModel, effort, last: Date.now(), tempDir,
+    record: [], // fingerprints of the history the child has seen, reply included
+    pending: [], // tool_use ids of the last reply, awaiting the caller's results
     busy: false, aborted: false, _abortWait: null,
   };
   log(`conversation created model=${sdkModel} effort=${effort ?? "(model default)"}`);
@@ -391,7 +398,7 @@ function destroyConversation(key) {
   conversations.delete(key);
   conv._abortWait?.({ aborted: true });
   conv._abortWait = null;
-  for (const resolve of conv.parked.values()) resolve("(tool call aborted: session ended)");
+  for (const resolve of conv.parked.values()) resolve({ text: "(tool call aborted: session ended)" });
   conv.parked.clear();
   try {
     conv.child.stdin.end();
@@ -407,6 +414,12 @@ function destroyConversation(key) {
 setInterval(() => {
   const now = Date.now();
   for (const [key, conv] of conversations) {
+    // A busy turn is bounded by TURN_TIMEOUT_MS already. A child waiting on
+    // the caller's tool gets longer: a slow test run must not come back to a
+    // reaped conversation and a lossy transcript replay.
+    // ponytail: fixed 1h for parked children; make it configurable if a tool ever runs longer.
+    if (conv.busy) continue;
+    if (conv.pending.length && now - conv.last < 60 * 60 * 1000) continue;
     if (now - conv.last > IDLE_MS) {
       log("idle conversation closed");
       destroyConversation(key);
@@ -468,7 +481,7 @@ async function nextTurn(conv) {
     // answer hides the failure from the caller, so it becomes turn.error.
     // max_output_tokens is a truncated answer, not a failure. Either way the
     // synthetic text is not model output; drain on to the result so the
-    // result-per-push count holds. (Unverified live: assumes the truncated
+    // child is idle when the turn returns. (Unverified live: assumes the truncated
     // real message arrives before the synthetic one.)
     if (msg.type === "assistant" && msg.error) {
       if (msg.error === "max_output_tokens") stopReason = "max_tokens";
@@ -495,7 +508,7 @@ async function nextTurn(conv) {
       const sr = msg.message?.stop_reason;
       if (sr) {
         // Keep draining: the child ends every turn with a `result` message,
-        // and the result counter depends on seeing exactly one per user push.
+        // and the next write must find it idle.
         stopReason = sr;
       }
     } else if (msg.type === "result") {
@@ -519,29 +532,79 @@ async function nextTurn(conv) {
   return { blocks, stopReason: stopReason ?? "end_turn", timedOut, aborted, hadResult, ended, error };
 }
 
-// Render pi's message history as a single transcript prompt for a fresh
-// child. The child knows nothing (its own context died with the old
-// conversation), so the whole visible conversation is replayed in one prompt
-// and the model answers the final message in context. Earlier blocks are
-// capped to keep a big session from costing more than it must; the final
-// message is the one being answered, so it goes through whole.
+// Render the caller's history as ONE prompt for a fresh child. The child knows
+// nothing (its own context died with the old conversation), so the whole
+// visible conversation is replayed and the model answers the final message in
+// context. Earlier text is capped to keep a big session from costing more than
+// it must; the final message is the one being answered, so it goes through
+// whole. Images stay image blocks. A lone opening message goes verbatim.
 function renderTranscript(messages) {
-  const parts = [];
+  if (messages.length === 1 && messages[0].role === "user") return userBlocks(messages[0].content);
+  const out = []; // strings and image blocks, in order
   for (const [i, m] of messages.entries()) {
     const cap = (s) => (i < messages.length - 1 && s.length > 4000 ? s.slice(0, 4000) + "…[truncated]" : s);
-    if (!Array.isArray(m.content)) {
-      const t = textOf(m.content);
-      if (t) parts.push(`User: ${cap(t)}`);
-      continue;
-    }
-    for (const b of m.content) {
-      if (b?.type === "text") parts.push(`${m.role === "user" ? "User" : "Assistant"}: ${cap(b.text ?? "")}`);
-      else if (b?.type === "tool_use") parts.push(`Assistant called tool ${b.name} with ${cap(JSON.stringify(b.input ?? {}))}`);
-      else if (b?.type === "tool_result") parts.push(`Tool result: ${cap(toolResultText(b))}`);
+    const who = m.role === "user" ? "User" : "Assistant";
+    const blocks = typeof m.content === "string" ? [{ type: "text", text: m.content }] : Array.isArray(m.content) ? m.content : [];
+    for (const b of blocks) {
+      if (b?.type === "text" && b.text) out.push(`${who}: ${cap(b.text)}`);
+      else if (b?.type === "image" && b.source) out.push(`${who} attached an image:`, { type: "image", source: b.source });
+      else if (b?.type === "tool_use") out.push(`Assistant called tool ${b.name} with ${cap(JSON.stringify(b.input ?? {}))}`);
+      else if (b?.type === "tool_result") {
+        out.push(`Tool result${b.is_error ? " (error)" : ""}:`);
+        for (const r of toolResultBlocks(b)) out.push(r.type === "image" ? r : cap(r.text));
+      }
     }
   }
-  parts.push("Continue this conversation. Respond to the most recent user message, using the conversation above as context.");
-  return parts.join("\n\n");
+  out.push("Continue this conversation: respond to its final message (a user message or a tool result), using everything above as context.");
+  const content = []; // adjacent strings merge into one text block
+  for (const x of out) {
+    const last = content.at(-1);
+    if (typeof x !== "string") content.push(x);
+    else if (last?.type === "text") last.text += "\n\n" + x;
+    else content.push({ type: "text", text: x });
+  }
+  return content;
+}
+
+const sha1 = (s) => crypto.createHash("sha1").update(s).digest("hex");
+
+// A message's identity across requests. Clients rewrite old tool_result
+// content (OMP and OpenCode prune superseded outputs), strip old images (OMP)
+// and re-serialize assistant text and thinking, so none of that takes part.
+// Role, user text and tool ids are stable in pi, OMP and @ai-sdk/anthropic.
+function fingerprint(m) {
+  const blocks = Array.isArray(m?.content) ? m.content : [];
+  if (m?.role === "assistant") return "a:" + blocks.filter((b) => b?.type === "tool_use").map((b) => b.id).join(",");
+  const results = blocks.filter((b) => b?.type === "tool_result").map((b) => b.tool_use_id).join(",");
+  return `${m?.role}:${sha1(textOf(userBlocks(m?.content)))}:${results}`;
+}
+
+// How a request continues the live child, or { reason } it cannot. It must
+// start with exactly the history the child has seen and add only user
+// messages. While the child is blocked in tool calls, those messages must
+// answer every pending call and nothing else; otherwise they must carry new
+// user input.
+function continuation(conv, messages, fps) {
+  if (conv.q.stale()) return { reason: "child produced a reply nobody requested" };
+  const seen = conv.record;
+  const at = seen.findIndex((fp, i) => fps[i] !== fp);
+  if (at >= 0) return { reason: `history diverged at message ${at} (${seen[at].slice(0, 12)} vs ${String(fps[at]).slice(0, 12)})` };
+  const tail = messages.slice(seen.length);
+  if (!tail.length) return { reason: `nothing new past the ${seen.length} messages the child has seen` };
+  const other = tail.find((m) => m.role !== "user");
+  if (other) return { reason: `new ${other.role} message the child did not produce` };
+  const results = tail.flatMap((m) => (Array.isArray(m.content) ? m.content.filter((b) => b?.type === "tool_result") : []));
+  const input = tail.flatMap((m) => userBlocks(m.content));
+  const answered = results.map((b) => b.tool_use_id).sort().join(",");
+  if (conv.pending.length) {
+    if (answered !== [...conv.pending].sort().join(",")) return { reason: `tool results [${answered}] do not answer pending [${conv.pending}]` };
+    if (conv.pending.some((id) => !conv.parked.has(id))) return { reason: "a pending tool call never reached the bridge" };
+  } else if (results.length) {
+    return { reason: "tool results for calls the child is not waiting on" };
+  } else if (!input.length) {
+    return { reason: "no new user input" };
+  }
+  return { results, input };
 }
 
 async function handleMessages(body, res) {
@@ -563,16 +626,33 @@ async function handleMessages(body, res) {
     normalizeEffort(body.effort) ??
     normalizeEffort(body.output_config?.effort);
 
+  const fps = messages.map(fingerprint);
   let conv = conversations.get(key);
-  // The CLI fixes --effort at spawn time. Recreate whenever a requested effort
-  // differs from the child's spawn-fixed one — including when the child has
-  // none yet (started via a base id, now an :effort variant was picked). A
-  // request carrying no effort keeps the child as-is (pi replays the full
-  // history, so a fresh child reconstructed from the transcript loses nothing).
-  if (conv && requestedEffort && requestedEffort !== conv.effort) {
-    log(`effort change ${conv.effort} -> ${requestedEffort}; recreating conversation`);
-    destroyConversation(key);
-    conv = undefined;
+
+  // The conversation is stateful on the child side, so two concurrent requests
+  // for the same key (e.g. two pi instances resumed on one session) would
+  // interleave writes and steal each other's turns. Refuse the second writer
+  // before anything below can tear down the first one's child.
+  if (conv?.busy) {
+    log("concurrent request refused: conversation already in flight");
+    throw new Error("conversation already has a request in flight (another client is driving this session)");
+  }
+
+  // Reuse the live child only when this request continues exactly what it
+  // has seen. Anything else — an effort change (the CLI fixes --effort at
+  // spawn), undo, edit, fork, a resend, another model's replies — rebuilds it
+  // from the transcript, which replays the caller's whole visible history.
+  let plan = null;
+  if (conv) {
+    plan = requestedEffort && requestedEffort !== conv.effort
+      ? { reason: `effort change ${conv.effort} -> ${requestedEffort}` }
+      : continuation(conv, messages, fps);
+    if (plan.reason) {
+      log(`${plan.reason}; rebuilding conversation from transcript`);
+      destroyConversation(key);
+      conv = undefined;
+      plan = null;
+    }
   }
   if (!conv) {
     conv = createConversation({
@@ -585,15 +665,6 @@ async function handleMessages(body, res) {
     conversations.set(key, conv);
   }
   conv.last = Date.now();
-
-  // The conversation is stateful on the child side, so two concurrent requests
-  // for the same key (e.g. two pi instances resumed on one session) would
-  // interleave user pushes and steal each other's turns — one sees an empty
-  // response, the other hangs forever. Refuse the second writer instead.
-  if (conv.busy) {
-    log("concurrent request refused: conversation already in flight");
-    throw new Error("conversation already has a request in flight (another client is driving this session)");
-  }
   conv.busy = true;
   conv.aborted = false;
   // A client that disconnects mid-turn (Ctrl-C on pi) must not keep the turn
@@ -607,147 +678,70 @@ async function handleMessages(body, res) {
     conv._abortWait?.({ aborted: true });
     for (const [id, resolve] of conv.parked) {
       conv.parked.delete(id);
-      resolve("(tool call aborted: client disconnected)");
+      resolve({ text: "(tool call aborted: client disconnected)" });
     }
   });
 
   try {
-  // User text in order. Text in the same message as tool_results
-  // ([tool_result…, text] is canonical wire — @ai-sdk/anthropic merges a tool
-  // message and the user message after it into that shape) remembers the
-  // message's last tool_use_id, so it can ride in on that result below.
-  const userTexts = [];
-  const ridesOn = new Map(); // text index -> tool_use_id
-  for (const m of messages) {
-    if (m.role !== "user") continue;
-    const text = textOf(m.content);
-    if (!text) continue;
-    const ids = Array.isArray(m.content)
-      ? m.content.filter((b) => b?.type === "tool_result" && typeof b.tool_use_id === "string").map((b) => b.tool_use_id)
-      : [];
-    if (ids.length) ridesOn.set(userTexts.length, ids.at(-1));
-    userTexts.push(text);
-  }
-  const isFresh = conv.pushedTotal === 0;
-
-  // New user texts for a live child. Newness is positional, not by content:
-  // the caller replays an append-only history, so the first seenUserTexts
-  // user-text messages were already fed and everything after them is new —
-  // even a text that repeats an earlier one verbatim (hash-dedupe silently
-  // dropped those, leaving the turn hanging until TURN_TIMEOUT_MS and the
-  // conversation destroyed). The hash set only serves the rewrite fallback: if
-  // the history SHRANK, the caller compacted it, positions no longer align,
-  // and only content can identify what is new.
-  let fresh = [];
-  if (!isFresh) {
-    if (userTexts.length >= conv.seenUserTexts) {
-      fresh = userTexts.map((_, i) => i).slice(conv.seenUserTexts);
-    } else {
-      log(`history shrank (${userTexts.length} < ${conv.seenUserTexts} texts); deduping by content`);
-      fresh = userTexts.map((_, i) => i).filter((i) => !conv.pushedUsers.has(userHash(userTexts[i])));
-    }
-  }
-
-  // 1. Resolve parked tool calls with any tool_result blocks in this request.
-  //    A new text riding on a parked call is appended to its result: the
-  //    child is still inside that tool's turn, and a raw stdin push there
-  //    would make the result-per-push accounting drift.
-  const riders = new Map(); // tool_use_id -> [text index]
-  for (const i of fresh) {
-    const id = ridesOn.get(i);
-    if (id && conv.parked.has(id) && !conv.resolved.has(id)) riders.set(id, [...(riders.get(id) ?? []), i]);
-  }
-  for (const m of messages) {
-    if (m.role !== "user" || !Array.isArray(m.content)) continue;
-    for (const b of m.content) {
-      if (b?.type !== "tool_result" || typeof b.tool_use_id !== "string") continue;
-      if (conv.resolved.has(b.tool_use_id)) continue;
-      conv.resolved.add(b.tool_use_id);
-      const resolve = conv.parked.get(b.tool_use_id);
-      if (resolve) {
+    // 1. Feed the child. Exactly one write per turn, and only while the child
+    //    is idle or blocked on the calls this request answers, so the next
+    //    result is always this request's answer.
+    if (!plan) {
+      writeUserMessage(conv, renderTranscript(messages));
+    } else if (conv.pending.length) {
+      // The child is still inside the turn that made these calls. New user
+      // input goes to stdin BEFORE the results: the CLI (2.1.282, probed)
+      // folds input that arrives while a tool runs into that same turn as
+      // real user text, one result for both. Carried inside the tool_result
+      // instead, the model treats it as tool output and ignores it. The pipe
+      // write lands before the result can travel shim -> bridge -> CLI.
+      if (plan.input.length) {
+        log(`steer ${plan.input.length} block(s) into the running turn: ${textOf(plan.input).slice(0, 80)}`);
+        writeUserMessage(conv, plan.input);
+      }
+      for (const b of plan.results) {
+        const resolve = conv.parked.get(b.tool_use_id);
         conv.parked.delete(b.tool_use_id);
-        const extra = riders.get(b.tool_use_id)?.map((i) => userTexts[i]);
-        resolve(toolResultText(b) + (extra ? `\n\nUser message sent with this tool result:\n${extra.join("\n\n")}` : ""));
+        resolve({ content: toolResultBlocks(b), isError: b.is_error === true });
       }
+    } else {
+      log(`pushed ${plan.input.length} block(s): ${textOf(plan.input).slice(0, 80)}`);
+      writeUserMessage(conv, plan.input);
     }
-  }
-
-  // 2. Feed user turns to the child. A fresh child knows nothing, so its
-  //    history arrives as ONE synthesized transcript prompt — re-pushing the
-  //    backlog text-by-text makes the child merge queued turns and the
-  //    result-per-push accounting drift. A live child only gets new texts.
-  if (isFresh) {
-    writeUserMessage(conv, renderTranscript(messages));
-    conv.pushedTotal = 1;
-    for (const t of userTexts) conv.pushedUsers.add(userHash(t));
-    conv.seenUserTexts = userTexts.length;
+    conv.pending = [];
     conv.last = Date.now();
-  } else {
-    const riding = new Set([...riders.values()].flat());
-    const newtexts = fresh.filter((i) => !riding.has(i)).map((i) => userTexts[i]);
-    for (const i of fresh) conv.pushedUsers.add(userHash(userTexts[i]));
-    conv.seenUserTexts = userTexts.length;
-    // All new texts in one request are merged into ONE push: the CLI merges
-    // queued inputs into a single response, so one push = one result = the
-    // result-per-push accounting can't drift.
-    if (newtexts.length) {
-      conv.pushedTotal++;
-      const merged = newtexts.join("\n\n");
-      log(`pushed ${newtexts.length} text(s) ${merged.length}b: ${merged.slice(0, 80)}`);
-      writeUserMessage(conv, merged);
-      conv.last = Date.now();
+
+    // 2. The next assistant turn: up to its result, or its first tool call.
+    const turn = await nextTurn(conv);
+    // None of these is an answer; a 200 end_turn would make the caller store an
+    // empty or error-text reply and never retry.
+    if (turn.timedOut) throw apiError(504, "timeout_error", `claude produced no output for ${TURN_TIMEOUT_MS}ms`);
+    if (turn.aborted || (turn.ended && !turn.hadResult)) {
+      throw apiError(500, "api_error", "claude conversation ended before the turn completed");
     }
-  }
-
-  // 3. Produce the next assistant turn. A fresh child replaying a backlog
-  //    answers historical user texts one per turn; only the response to the
-  //    LAST push is this request's answer — discard the earlier ones.
-  let turn;
-  for (;;) {
-    turn = await nextTurn(conv);
-    if (turn.timedOut || turn.aborted) break;
-    if (turn.hadResult) conv.consumedResults++;
-    else break; // tool_use turn: its parks are live, the caller must execute them
-    if (conv.consumedResults >= conv.pushedTotal - 1) break;
-    log(`discarding stale replayed response (${conv.consumedResults}/${conv.pushedTotal - 1})`);
-  }
-
-  // A turn that ended on the timeout never got a single child message, so the
-  // child is wedged (or gone silently); drop the conversation so the next
-  // request starts a fresh child instead of blocking on the same corpse.
-  // Same for a client-disconnect abort: the child may have half-consumed the
-  // turn, so replay it against a fresh child rather than trusting the corpse.
-  if (turn.timedOut || turn.aborted) {
-    for (const [k, c] of conversations) {
-      if (c === conv) {
-        destroyConversation(k);
-        break;
-      }
+    if (turn.error) {
+      const [status, type] = CLI_ERRORS[turn.error.kind] ?? [500, "api_error"];
+      throw apiError(status, type, turn.error.message);
     }
-  }
-  // None of these is an answer; a 200 end_turn would make the caller store an
-  // empty or error-text reply and never retry. (A dead child already removed
-  // itself on 'close'.)
-  if (turn.timedOut) throw apiError(504, "timeout_error", `claude produced no output for ${TURN_TIMEOUT_MS}ms`);
-  if (turn.aborted || (turn.ended && !turn.hadResult)) {
-    throw apiError(500, "api_error", "claude conversation ended before the turn completed");
-  }
-  if (turn.error) {
-    const [status, type] = CLI_ERRORS[turn.error.kind] ?? [500, "api_error"];
-    throw apiError(status, type, turn.error.message);
-  }
 
-  // 4. A tool_use turn ends only once every call has parked — that is the
-  //    point at which the caller can execute them and come back.
-  if (turn.stopReason === "tool_use") {
-    const ids = turn.blocks.filter((b) => b.type === "tool_use").map((b) => b.id);
+    // The reply becomes part of the history the child has seen, as the caller
+    // will replay it: an assistant message carrying these tool calls.
+    const calls = turn.blocks.filter((b) => b.type === "tool_use").map((b) => b.id);
+    conv.record = [...fps, fingerprint({ role: "assistant", content: turn.blocks })];
+    conv.pending = calls;
+
+    // 3. A tool_use turn ends only once every call has parked — that is the
+    //    point at which the caller can execute them and come back.
     const deadline = Date.now() + PARK_TIMEOUT_MS;
-    while (ids.some((id) => !conv.parked.has(id)) && !conv.aborted && Date.now() < deadline) {
+    while (calls.some((id) => !conv.parked.has(id)) && !conv.aborted && Date.now() < deadline) {
       await sleep(25);
     }
-  }
-
-  return { conv, turn };
+    return { conv, turn };
+  } catch (e) {
+    // The caller stores no reply for a failed turn, so the child is ahead of
+    // (or wedged behind) the caller's history. The next request rebuilds.
+    if (conversations.get(key) === conv) destroyConversation(key);
+    throw e;
   } finally {
     conv.busy = false;
   }
@@ -994,6 +988,7 @@ server.on("error", (e) => {
 
 server.listen(PORT, "127.0.0.1", () => {
   log(`listening on http://127.0.0.1:${PORT} (models: ${MODELS.length}, bridge: ${internalPort})`);
+  if (process.versions.bun) log("WARNING: running under bun, whose node:http never reports client disconnects; cancelled turns will run to completion. Run the shim with node.");
 });
 
 for (const sig of ["SIGINT", "SIGTERM"]) {

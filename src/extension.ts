@@ -43,20 +43,31 @@ async function shimUp(): Promise<boolean> {
  */
 function bootShim(): void {
   if (!existsSync(SHIM)) return;
-  const child = spawn(process.execPath, [SHIM], {
-    cwd: join(HERE, "..", "shim"),
-    detached: true,
-    stdio: "ignore",
-    env: {
-      ...process.env,
-      USER: process.env.USER || process.env.LOGNAME || "user",
-      LOGNAME: process.env.LOGNAME || process.env.USER || "user",
-      SHELL: process.env.SHELL || "/bin/sh",
-      TMPDIR: process.env.TMPDIR || "/tmp",
-      HOME: process.env.HOME || homedir(),
-    },
-  });
-  child.unref();
+  // Run it under node, not the host's runtime. Under bun, node:http never
+  // reports a client disconnect, so the shim cannot abort a turn the user
+  // cancelled; and a bun-compiled host's execPath is not a JS runtime at all.
+  // No node on PATH: fall back to the host, told to behave as plain bun.
+  const start = (cmd: string, extraEnv: Record<string, string> = {}) => {
+    const child = spawn(cmd, [SHIM], {
+      cwd: join(HERE, "..", "shim"),
+      detached: true,
+      stdio: "ignore",
+      env: {
+        ...process.env,
+        USER: process.env.USER || process.env.LOGNAME || "user",
+        LOGNAME: process.env.LOGNAME || process.env.USER || "user",
+        SHELL: process.env.SHELL || "/bin/sh",
+        TMPDIR: process.env.TMPDIR || "/tmp",
+        HOME: process.env.HOME || homedir(),
+        ...extraEnv,
+      },
+    });
+    child.on("error", () => {
+      if (cmd === "node") start(process.execPath, { BUN_BE_BUN: "1" });
+    });
+    child.unref();
+  };
+  start(process.versions.bun ? "node" : process.execPath);
 }
 
 export default async function (pi: ExtensionAPI): Promise<void> {

@@ -22,8 +22,13 @@ const say = (text) => {
 };
 const mcp = JSON.parse(fs.readFileSync(process.argv[process.argv.indexOf("--mcp-config") + 1], "utf8"));
 const bridge = Object.values(mcp.mcpServers)[0].env;
+// Like the real CLI, input that arrives while a tool call runs is folded into
+// that turn instead of starting a new one.
+let inTool = false;
+const folded = [];
 rl.on("line", async (line) => {
   const content = JSON.parse(line).message.content;
+  if (inTool) return folded.push(JSON.stringify(content));
   const text = typeof content === "string" ? content : JSON.stringify(content);
   if (text.includes("DIE") && !fs.existsSync(process.env.STUB_DIED)) {
     fs.writeFileSync(process.env.STUB_DIED, "");
@@ -36,10 +41,14 @@ rl.on("line", async (line) => {
   }
   if (text.includes("TOOL") && !text.includes("Tool result")) {
     out({ type: "assistant", message: { content: [{ type: "tool_use", id: "toolu_1", name: "mcp__cctools__echo", input: {} }] } });
+    inTool = true;
     const r = await fetch("http://127.0.0.1:" + bridge.CLAUDE_BRIDGE_PORT + "/internal/toolcall", {
       method: "POST", body: JSON.stringify({ conv: bridge.CLAUDE_BRIDGE_CONV, id: "toolu_1" }),
     });
-    return say("tool said: " + (await r.json()).text);
+    const reply = await r.json();
+    inTool = false;
+    const said = (reply.content ?? [reply]).map((b) => b.text ?? "[" + b.type + "]").join("\\n");
+    return say("tool said: " + said + (folded.length ? " | folded: " + folded.splice(0).join(" ") : ""));
   }
   say("echo: " + text);
 });
@@ -129,14 +138,57 @@ test("the message being answered is never truncated", async () => {
   assert.ok(text(await request(msgs(user("opening"), { role: "assistant", content: "ok" }, user(long)))).includes(long));
 });
 
-test("text riding with a tool_result reaches the child", async () => {
+test("text sent with a tool_result is folded into the running turn", async () => {
   const opening = user("TOOL go");
   const r1 = JSON.parse((await request(msgs(opening))).data);
   assert.equal(r1.stop_reason, "tool_use");
   const r2 = await request(msgs(
     opening,
     { role: "assistant", content: r1.content },
-    user([{ type: "tool_result", tool_use_id: "toolu_1", content: "out" }, { type: "text", text: "steer left" }]),
+    user([
+      { type: "tool_result", tool_use_id: "toolu_1", content: [{ type: "text", text: "out" }, { type: "image", source: IMG }] },
+      { type: "text", text: "steer left" },
+    ]),
   ));
-  assert.match(text(r2), /tool said: out\n\nUser message sent with this tool result:\nsteer left/);
+  assert.match(text(r2), /tool said: out\n\[image\] \| folded: .*steer left/);
+  // Nothing was written to the child mid-turn, so the next reply answers the
+  // next message rather than lagging one behind.
+  const r3 = await request(msgs(
+    opening,
+    { role: "assistant", content: r1.content },
+    user([{ type: "tool_result", tool_use_id: "toolu_1", content: "out" }, { type: "text", text: "steer left" }]),
+    { role: "assistant", content: JSON.parse(r2.data).content },
+    user("after the tool"),
+  ));
+  assert.match(text(r3), /^echo: .*after the tool/);
+});
+
+const IMG = { type: "base64", media_type: "image/png", data: "iVBORw0KGgo=" };
+
+test("live child gets only the new message; an edited history rebuilds it", async () => {
+  const a = user("alpha live");
+  const r1 = JSON.parse((await request(msgs(a))).data);
+  const next = [a, { role: "assistant", content: r1.content }];
+  const live = text(await request(msgs(...next, user("beta"))));
+  assert.match(live, /echo: \[\{"type":"text","text":"beta"\}\]/);
+  // Same length, different last message: the child's context no longer
+  // matches, so it is rebuilt from the transcript instead of hanging.
+  const edited = text(await request(msgs(...next, user("gamma"))));
+  assert.match(edited, /Continue this conversation/);
+  assert.match(edited, /User: gamma/);
+});
+
+test("an identical resend rebuilds instead of waiting on an idle child", async () => {
+  const a = user("alpha resend");
+  const r1 = JSON.parse((await request(msgs(a))).data);
+  const history = msgs(a, { role: "assistant", content: r1.content }, user("again"));
+  assert.equal((await request(history)).status, 200);
+  const resent = await request(history);
+  assert.equal(resent.status, 200);
+  assert.match(text(resent), /Continue this conversation/);
+});
+
+test("user images reach the child as image blocks", async () => {
+  const r = await request(msgs(user([{ type: "text", text: "look" }, { type: "image", source: IMG }])));
+  assert.match(text(r), /"type":"image","source":\{"type":"base64","media_type":"image\/png"/);
 });

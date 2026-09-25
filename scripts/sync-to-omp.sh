@@ -1,6 +1,6 @@
 #!/bin/bash
 # Sync the shim into OMP's installed copy and restart whichever shim owns :8792
-# (OMP's bun process respawns on demand; a repo-side node process does not).
+# (OMP respawns it on demand; a repo-side process does not).
 set -e
 SRC="$(cd "$(dirname "$0")/.." && pwd)/shim"
 DST="$HOME/.omp/plugins/node_modules/claude-cli-provider/shim"
@@ -20,7 +20,10 @@ done
 # Respawn so callers (OMP mid-session, opencode, pi) never see ConnectionRefused.
 # Covers both "we just killed it" and "it was already dead before this run".
 if [ -z "$(lsof -ti :8792 2>/dev/null)" ]; then
-  (cd "$DST" && nohup "${BUN:-$HOME/.bun/bin/bun}" server.mjs > /tmp/claude-shim-cli.log 2>&1 &)
+  # node, not bun: under bun a client disconnect never reaches the shim, so
+  # cancelled turns keep running.
+  RUNTIME="$(command -v node || echo "${BUN:-$HOME/.bun/bin/bun}")"
+  (cd "$DST" && nohup "$RUNTIME" server.mjs > /tmp/claude-shim-cli.log 2>&1 &)
   sleep 1.5
   lsof -ti :8792 >/dev/null && echo "shim restarted" || echo "WARN: shim failed to start"
 fi

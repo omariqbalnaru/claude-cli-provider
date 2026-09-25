@@ -25,7 +25,9 @@ async function callTool(msg) {
   const name = msg.params?.name ?? "";
   const input = msg.params?.arguments ?? {};
   const body = JSON.stringify({ conv: CONV, id, name, input });
-  const text = await new Promise((resolve) => {
+  // The shim answers { content: [Anthropic blocks], isError } for a real tool
+  // result, or { text } for its own aborts and failures.
+  const reply = await new Promise((resolve) => {
     const req = http.request(
       {
         host: "127.0.0.1",
@@ -39,17 +41,27 @@ async function callTool(msg) {
         res.on("data", (c) => (b += c));
         res.on("end", () => {
           try {
-            resolve(JSON.parse(b).text ?? "(empty tool result)");
+            resolve(JSON.parse(b));
           } catch {
-            resolve("(bridge: unreadable shim response)");
+            resolve({ text: "(bridge: unreadable shim response)" });
           }
         });
       },
     );
-    req.on("error", (e) => resolve(`(tool call failed: ${e?.message ?? e})`));
+    req.on("error", (e) => resolve({ text: `(tool call failed: ${e?.message ?? e})` }));
     req.end(body);
   });
-  return { content: [{ type: "text", text }] };
+  const blocks = reply.content ?? [{ type: "text", text: reply.text ?? "(empty tool result)" }];
+  return { content: blocks.map(toMcp), ...(reply.isError && { isError: true }) };
+}
+
+// Anthropic content block -> MCP content item. MCP images carry base64 only.
+function toMcp(b) {
+  if (b?.type === "image" && b.source?.type === "base64") {
+    return { type: "image", data: b.source.data, mimeType: b.source.media_type };
+  }
+  if (b?.type === "image") return { type: "text", text: `[image: ${b.source?.url ?? "unsupported source"}]` };
+  return { type: "text", text: b?.text ?? `[${b?.type ?? "block"}]` };
 }
 
 function handle(msg) {

@@ -20,7 +20,7 @@
 import http from "node:http";
 import crypto from "node:crypto";
 import { spawn } from "node:child_process";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -322,6 +322,15 @@ function createConversation({ key, system, tools, model, effort }) {
     // Claude Code's names ("Tool Bash not found"). Only the MCP bridge's
     // tools — pi's own — are visible to the model.
     "--tools", "",
+    // The caller's tools by rule, not only by bypass mode: a policy or env
+    // downgrade to default mode would otherwise deny every call under -p.
+    "--allowedTools", `mcp__${MCP_SERVER_NAME}`,
+    // User text is the caller's, never a Claude Code command ("/clear", …).
+    "--disable-slash-commands",
+    // The shim never resumes a child session (a new child gets a transcript),
+    // so writing each one — system prompt, tool outputs and all — under
+    // ~/.claude/projects is pure exposure.
+    "--no-session-persistence",
   ];
   if (systemAppend) childArgs.push("--append-system-prompt-file", sysFile);
   if (effort) childArgs.push("--effort", effort);
@@ -334,9 +343,19 @@ function createConversation({ key, system, tools, model, effort }) {
   env.TMPDIR = env.TMPDIR || "/tmp";
   env.HOME = env.HOME || tmpdir();
   env.DISABLE_AUTO_COMPACT = "1";
+  // Auto-memory would have the model keep notes in one directory shared by
+  // every client and project (and --setting-sources "" hides a user's own
+  // opt-out).
+  env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
+
+  // An empty, non-git working directory per conversation. The child's session
+  // context comes from its cwd; the shim's own directory told the model it was
+  // working in this repo, with its branch, commits and git user.
+  const cwd = join(tempDir, "cwd");
+  mkdirSync(cwd);
 
   const child = spawn("claude", childArgs, {
-    cwd: HERE, // keep transcripts in the shim's own project folder
+    cwd,
     stdio: ["pipe", "pipe", "pipe"],
     env,
   });
@@ -696,7 +715,7 @@ async function handleMessages(body, res) {
       // instead, the model treats it as tool output and ignores it. The pipe
       // write lands before the result can travel shim -> bridge -> CLI.
       if (plan.input.length) {
-        log(`steer ${plan.input.length} block(s) into the running turn: ${textOf(plan.input).slice(0, 80)}`);
+        log(`steer ${plan.input.length} block(s), ${textOf(plan.input).length} chars into the running turn`);
         writeUserMessage(conv, plan.input);
       }
       for (const b of plan.results) {
@@ -705,7 +724,7 @@ async function handleMessages(body, res) {
         resolve({ content: toolResultBlocks(b), isError: b.is_error === true });
       }
     } else {
-      log(`pushed ${plan.input.length} block(s): ${textOf(plan.input).slice(0, 80)}`);
+      log(`pushed ${plan.input.length} block(s), ${textOf(plan.input).length} chars`);
       writeUserMessage(conv, plan.input);
     }
     conv.pending = [];

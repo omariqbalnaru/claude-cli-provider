@@ -35,6 +35,7 @@ rl.on("line", async (line) => {
     process.exit(1);
   }
   if (text.includes("ENV")) return say(Object.keys(process.env).join(","));
+  if (text.includes("ARGS")) return say(JSON.stringify({ argv: process.argv.slice(2), cwd: process.cwd(), files: fs.readdirSync(process.cwd()), memory: process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY }));
   if (text.includes("FAIL")) {
     out({ type: "assistant", error: "rate_limit", message: { model: "<synthetic>", content: [{ type: "text", text: "usage limit hit" }], stop_reason: "stop_sequence" } });
     return out({ type: "result", subtype: "success", is_error: true, result: "usage limit hit" });
@@ -115,6 +116,15 @@ test("child env drops ANTHROPIC_* but keeps subscription auth", async () => {
   const keys = text(await request(msgs(user("ENV")))).split(",");
   assert.ok(!keys.some((k) => k.startsWith("ANTHROPIC_")), keys.join(","));
   assert.ok(keys.includes("CLAUDE_CODE_OAUTH_TOKEN"));
+});
+
+test("child runs isolated: no slash commands, no session files, no memory, empty cwd", async () => {
+  const info = JSON.parse(text(await request(msgs(user("ARGS")))).replace(/^echo: /, ""));
+  for (const flag of ["--disable-slash-commands", "--no-session-persistence", "--allowedTools"]) assert.ok(info.argv.includes(flag), flag);
+  assert.equal(info.argv[info.argv.indexOf("--allowedTools") + 1], "mcp__cctools");
+  assert.equal(info.memory, "1");
+  assert.deepEqual(info.files, []);
+  assert.ok(!info.cwd.startsWith(ROOT), info.cwd);
 });
 
 test("CLI API error becomes an HTTP error, and an SSE error event when streaming", async () => {

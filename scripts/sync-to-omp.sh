@@ -23,7 +23,8 @@ if [ -z "$(lsof -ti :8792 2>/dev/null)" ]; then
   # node, not bun: under bun a client disconnect never reaches the shim, so
   # cancelled turns keep running.
   RUNTIME="$(command -v node || echo "${BUN:-$HOME/.bun/bin/bun}")"
-  (cd "$DST" && nohup "$RUNTIME" server.mjs > /tmp/claude-shim-cli.log 2>&1 &)
+  # Private log: the shim logs conversation metadata.
+  (umask 077; cd "$DST" && nohup "$RUNTIME" server.mjs >> "${TMPDIR:-/tmp}/claude-shim.log" 2>&1 &)
   sleep 1.5
   lsof -ti :8792 >/dev/null && echo "shim restarted" || echo "WARN: shim failed to start"
 fi

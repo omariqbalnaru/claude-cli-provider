@@ -49,7 +49,9 @@ case "${1:-start}" in
       }
     fi
     echo "starting claude-shim on :$PORT ..."
-    # Detach with a real login environment (Keychain auth needs it).
+    # Detach with a real login environment (Keychain auth needs it), and keep
+    # the log private: the shim logs conversation metadata.
+    umask 077
     USER="${USER:-$(id -un)}" LOGNAME="${LOGNAME:-$(id -un)}" \
     SHELL="${SHELL:-/bin/sh}" TMPDIR="${TMPDIR:-/tmp}" \
       nohup node "$SHIM_DIR/server.mjs" >>"$LOG" 2>&1 &

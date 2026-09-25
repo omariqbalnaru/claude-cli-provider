@@ -248,8 +248,17 @@ await new Promise((resolve) => {
 // The first-party entrypoint is the whole point of this backend: the SDK and
 // anything it leaves behind mark the child as third-party, which is what flips
 // billing to usage credits. Strip them defensively in case pi itself ever runs
-// under Claude Code.
-const STRIPPED_ENV = ["CLAUDE_CODE_ENTRYPOINT", "CLAUDE_AGENT_SDK_VERSION", "AI_AGENT"];
+// under Claude Code. Every ANTHROPIC_* var goes too: under -p the CLI prefers an
+// env API key / auth token over the keychain OAuth login (pi documents
+// exporting ANTHROPIC_API_KEY), and ANTHROPIC_BASE_URL can point the child back
+// at this shim. Same for the provider switches and CLAUDE_CODE_SIMPLE (skips
+// the keychain). CLAUDE_CODE_OAUTH_TOKEN and CLAUDE_CONFIG_DIR stay: they are
+// subscription auth.
+const STRIPPED_ENV = [
+  "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_AGENT_SDK_VERSION", "AI_AGENT",
+  "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_SIMPLE",
+];
+const strippedEnv = (k) => STRIPPED_ENV.includes(k) || k.startsWith("ANTHROPIC_");
 
 function createConversation({ key, system, tools, model, effort }) {
   const q = makeQueue();
@@ -312,7 +321,7 @@ function createConversation({ key, system, tools, model, effort }) {
   if (effort) childArgs.push("--effort", effort);
 
   const env = { ...process.env };
-  for (const k of STRIPPED_ENV) delete env[k];
+  for (const k of Object.keys(env)) if (strippedEnv(k)) delete env[k];
   env.USER = env.USER || env.LOGNAME || "user";
   env.LOGNAME = env.LOGNAME || env.USER || "user";
   env.SHELL = env.SHELL || "/bin/sh";
@@ -348,13 +357,24 @@ function createConversation({ key, system, tools, model, effort }) {
   child.stderr.on("data", (d) => {
     for (const line of String(d).split("\n")) if (line.trim()) log(`claude: ${line}`);
   });
-  child.on("exit", (code, signal) => {
-    log(`claude child exited code=${code} signal=${signal}`);
+  // A queued write to a dead child raises EPIPE here; unhandled, it kills the
+  // whole shim. The close handler below already tears the conversation down.
+  child.stdin.on("error", (e) => log("claude stdin error:", e?.code ?? e));
+  // A dead child must leave the map, or every later request on this key gets
+  // an instant empty reply from its ended queue. 'close' (not 'exit') so the
+  // last stdout lines are read first; the identity check matters because an
+  // effort change reuses the key for a new child.
+  const dead = () => {
     q.end();
+    if (conversations.get(key) === conv) destroyConversation(key);
+  };
+  child.on("close", (code, signal) => {
+    log(`claude child exited code=${code} signal=${signal}`);
+    dead();
   });
   child.on("error", (e) => {
     log("claude child spawn error:", e?.message ?? e);
-    q.end();
+    dead();
   });
 
   return conv;
@@ -396,6 +416,17 @@ setInterval(() => {
 
 // ---- turn handling ---------------------------------------------------------
 
+const apiError = (status, type, message) => Object.assign(new Error(message), { status, type });
+
+// The CLI's `error` tag on a failed assistant message → Anthropic HTTP error.
+const CLI_ERRORS = {
+  authentication_failed: [401, "authentication_error"],
+  billing_error: [402, "billing_error"],
+  rate_limit: [429, "rate_limit_error"],
+  invalid_request: [400, "invalid_request_error"],
+  overloaded: [529, "overloaded_error"],
+};
+
 async function nextTurn(conv) {
   const blocks = [];
   let stopReason = null;
@@ -403,6 +434,8 @@ async function nextTurn(conv) {
   let timedOut = false;
   let aborted = false;
   let hadResult = false;
+  let ended = false;
+  let error = null; // CLI-reported API failure: { kind, message }
   const deadline = Date.now() + TURN_TIMEOUT_MS;
   while (Date.now() < deadline) {
     // The deadline is only checked between messages, so a wedged child that
@@ -425,7 +458,23 @@ async function nextTurn(conv) {
       break;
     }
     const msg = winner.msg;
-    if (msg.__end) break;
+    if (msg.__end) {
+      ended = true;
+      break;
+    }
+    // On an API failure (auth, usage limit, prompt too long, overloaded) the
+    // CLI emits a synthetic assistant message whose text is the error, tagged
+    // with `error`, then an is_error result. Relaying that text as the model's
+    // answer hides the failure from the caller, so it becomes turn.error.
+    // max_output_tokens is a truncated answer, not a failure. Either way the
+    // synthetic text is not model output; drain on to the result so the
+    // result-per-push count holds. (Unverified live: assumes the truncated
+    // real message arrives before the synthetic one.)
+    if (msg.type === "assistant" && msg.error) {
+      if (msg.error === "max_output_tokens") stopReason = "max_tokens";
+      else error = { kind: msg.error, message: textOf(msg.message?.content) || msg.error };
+      continue;
+    }
     if (msg.type === "assistant") {
       const content = msg.message?.content;
       if (Array.isArray(content)) {
@@ -452,6 +501,10 @@ async function nextTurn(conv) {
     } else if (msg.type === "result") {
       stopReason = stopReason ?? "end_turn";
       hadResult = true;
+      if (msg.is_error && !error && stopReason !== "max_tokens") {
+        const detail = [msg.result, ...(msg.errors ?? [])].filter((x) => typeof x === "string" && x);
+        error = { kind: msg.subtype ?? "error", message: detail.join("; ") || `claude reported ${msg.subtype ?? "an error"}` };
+      }
       const u = msg.usage ?? {};
       log(
         `turn result subtype=${msg.subtype ?? "?"} session=${msg.session_id ?? "?"} ` +
@@ -461,19 +514,21 @@ async function nextTurn(conv) {
     }
   }
   if (timedOut) log(`turn timed out after ${TURN_TIMEOUT_MS}ms with no child message`);
-  if (aborted) log("turn aborted by client disconnect");
-  return { blocks, stopReason: stopReason ?? "end_turn", timedOut, aborted, hadResult };
+  if (aborted) log("turn aborted (client disconnect or conversation teardown)");
+  if (error) log(`turn failed: ${error.kind}: ${error.message.slice(0, 200)}`);
+  return { blocks, stopReason: stopReason ?? "end_turn", timedOut, aborted, hadResult, ended, error };
 }
 
 // Render pi's message history as a single transcript prompt for a fresh
 // child. The child knows nothing (its own context died with the old
 // conversation), so the whole visible conversation is replayed in one prompt
-// and the model answers the final message in context. Blocks are capped to
-// keep a big session from costing more than it must.
+// and the model answers the final message in context. Earlier blocks are
+// capped to keep a big session from costing more than it must; the final
+// message is the one being answered, so it goes through whole.
 function renderTranscript(messages) {
-  const cap = (s) => (s.length > 4000 ? s.slice(0, 4000) + "…[truncated]" : s);
   const parts = [];
-  for (const m of messages) {
+  for (const [i, m] of messages.entries()) {
+    const cap = (s) => (i < messages.length - 1 && s.length > 4000 ? s.slice(0, 4000) + "…[truncated]" : s);
     if (!Array.isArray(m.content)) {
       const t = textOf(m.content);
       if (t) parts.push(`User: ${cap(t)}`);
@@ -557,7 +612,51 @@ async function handleMessages(body, res) {
   });
 
   try {
+  // User text in order. Text in the same message as tool_results
+  // ([tool_result…, text] is canonical wire — @ai-sdk/anthropic merges a tool
+  // message and the user message after it into that shape) remembers the
+  // message's last tool_use_id, so it can ride in on that result below.
+  const userTexts = [];
+  const ridesOn = new Map(); // text index -> tool_use_id
+  for (const m of messages) {
+    if (m.role !== "user") continue;
+    const text = textOf(m.content);
+    if (!text) continue;
+    const ids = Array.isArray(m.content)
+      ? m.content.filter((b) => b?.type === "tool_result" && typeof b.tool_use_id === "string").map((b) => b.tool_use_id)
+      : [];
+    if (ids.length) ridesOn.set(userTexts.length, ids.at(-1));
+    userTexts.push(text);
+  }
+  const isFresh = conv.pushedTotal === 0;
+
+  // New user texts for a live child. Newness is positional, not by content:
+  // the caller replays an append-only history, so the first seenUserTexts
+  // user-text messages were already fed and everything after them is new —
+  // even a text that repeats an earlier one verbatim (hash-dedupe silently
+  // dropped those, leaving the turn hanging until TURN_TIMEOUT_MS and the
+  // conversation destroyed). The hash set only serves the rewrite fallback: if
+  // the history SHRANK, the caller compacted it, positions no longer align,
+  // and only content can identify what is new.
+  let fresh = [];
+  if (!isFresh) {
+    if (userTexts.length >= conv.seenUserTexts) {
+      fresh = userTexts.map((_, i) => i).slice(conv.seenUserTexts);
+    } else {
+      log(`history shrank (${userTexts.length} < ${conv.seenUserTexts} texts); deduping by content`);
+      fresh = userTexts.map((_, i) => i).filter((i) => !conv.pushedUsers.has(userHash(userTexts[i])));
+    }
+  }
+
   // 1. Resolve parked tool calls with any tool_result blocks in this request.
+  //    A new text riding on a parked call is appended to its result: the
+  //    child is still inside that tool's turn, and a raw stdin push there
+  //    would make the result-per-push accounting drift.
+  const riders = new Map(); // tool_use_id -> [text index]
+  for (const i of fresh) {
+    const id = ridesOn.get(i);
+    if (id && conv.parked.has(id) && !conv.resolved.has(id)) riders.set(id, [...(riders.get(id) ?? []), i]);
+  }
   for (const m of messages) {
     if (m.role !== "user" || !Array.isArray(m.content)) continue;
     for (const b of m.content) {
@@ -567,7 +666,8 @@ async function handleMessages(body, res) {
       const resolve = conv.parked.get(b.tool_use_id);
       if (resolve) {
         conv.parked.delete(b.tool_use_id);
-        resolve(toolResultText(b));
+        const extra = riders.get(b.tool_use_id)?.map((i) => userTexts[i]);
+        resolve(toolResultText(b) + (extra ? `\n\nUser message sent with this tool result:\n${extra.join("\n\n")}` : ""));
       }
     }
   }
@@ -576,15 +676,6 @@ async function handleMessages(body, res) {
   //    history arrives as ONE synthesized transcript prompt — re-pushing the
   //    backlog text-by-text makes the child merge queued turns and the
   //    result-per-push accounting drift. A live child only gets new texts.
-  // A user message whose blocks are tool_results is a resolution, not a turn.
-  const userTexts = [];
-  for (const m of messages) {
-    if (m.role !== "user") continue;
-    if (Array.isArray(m.content) && m.content.some((b) => b?.type === "tool_result")) continue;
-    const text = textOf(m.content);
-    if (text) userTexts.push(text);
-  }
-  const isFresh = conv.pushedTotal === 0;
   if (isFresh) {
     writeUserMessage(conv, renderTranscript(messages));
     conv.pushedTotal = 1;
@@ -592,22 +683,9 @@ async function handleMessages(body, res) {
     conv.seenUserTexts = userTexts.length;
     conv.last = Date.now();
   } else {
-    // Newness is positional, not by content: the caller replays an append-only
-    // history, so the first seenUserTexts user-text messages were already fed
-    // and everything after them is new — even a text that repeats an earlier
-    // one verbatim (hash-dedupe silently dropped those, leaving the turn
-    // hanging until TURN_TIMEOUT_MS and the conversation destroyed). The hash
-    // set only serves the rewrite fallback: if the history SHRANK, the caller
-    // compacted it, positions no longer align, and only content can identify
-    // what is new.
-    let newtexts;
-    if (userTexts.length >= conv.seenUserTexts) {
-      newtexts = userTexts.slice(conv.seenUserTexts);
-    } else {
-      log(`history shrank (${userTexts.length} < ${conv.seenUserTexts} texts); deduping by content`);
-      newtexts = userTexts.filter((t) => !conv.pushedUsers.has(userHash(t)));
-    }
-    for (const t of newtexts) conv.pushedUsers.add(userHash(t));
+    const riding = new Set([...riders.values()].flat());
+    const newtexts = fresh.filter((i) => !riding.has(i)).map((i) => userTexts[i]);
+    for (const i of fresh) conv.pushedUsers.add(userHash(userTexts[i]));
     conv.seenUserTexts = userTexts.length;
     // All new texts in one request are merged into ONE push: the CLI merges
     // queued inputs into a single response, so one push = one result = the
@@ -646,6 +724,17 @@ async function handleMessages(body, res) {
         break;
       }
     }
+  }
+  // None of these is an answer; a 200 end_turn would make the caller store an
+  // empty or error-text reply and never retry. (A dead child already removed
+  // itself on 'close'.)
+  if (turn.timedOut) throw apiError(504, "timeout_error", `claude produced no output for ${TURN_TIMEOUT_MS}ms`);
+  if (turn.aborted || (turn.ended && !turn.hadResult)) {
+    throw apiError(500, "api_error", "claude conversation ended before the turn completed");
+  }
+  if (turn.error) {
+    const [status, type] = CLI_ERRORS[turn.error.kind] ?? [500, "api_error"];
+    throw apiError(status, type, turn.error.message);
   }
 
   // 4. A tool_use turn ends only once every call has parked — that is the
@@ -754,17 +843,62 @@ function emitTurn(res, conv, turn, wantStream) {
 
 // ---- HTTP ------------------------------------------------------------------
 
+// Past this, a body is dropped instead of buffered (Buffer.concat past ~512 MiB
+// throws and kills the process). The Messages API's own request cap is 32 MB.
+const MAX_BODY_BYTES = 32 * 1024 * 1024;
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    req.on("data", (c) => chunks.push(c));
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    let size = 0;
+    req.on("data", (c) => {
+      size += c.length;
+      if (size <= MAX_BODY_BYTES) chunks.push(c);
+    });
+    req.on("end", () => {
+      if (size > MAX_BODY_BYTES) reject(apiError(413, "request_too_large", `request body over ${MAX_BODY_BYTES} bytes`));
+      else resolve(Buffer.concat(chunks).toString("utf8"));
+    });
     req.on("error", reject);
   });
 }
 
+function sendError(res, status, type, message) {
+  res.writeHead(status, { "content-type": "application/json" });
+  res.end(JSON.stringify({ type: "error", error: { type, message } }));
+}
+
+// Loopback only. Any web page can POST here (text/plain skips CORS preflight)
+// and DNS rebinding gets it a same-origin read, so a request must name a
+// loopback Host, and a browser Origin, if sent, must be loopback too. CLI
+// harnesses send no Origin.
+const LOOPBACK = new Set(["127.0.0.1", "localhost", "[::1]"]);
+function fromLoopback(req) {
+  const hostname = (h) => {
+    try {
+      return new URL(`http://${h}`).hostname;
+    } catch {
+      return "";
+    }
+  };
+  if (!LOOPBACK.has(hostname(req.headers.host ?? ""))) return false;
+  const origin = req.headers.origin;
+  if (origin === undefined) return true;
+  try {
+    return LOOPBACK.has(new URL(origin).hostname);
+  } catch {
+    return false;
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   const path = (req.url ?? "").split("?")[0].replace(/\/+$/, "") || "/";
+
+  if (!fromLoopback(req)) {
+    log(`refused non-loopback request host=${req.headers.host} origin=${req.headers.origin}`);
+    sendError(res, 403, "permission_error", "claude-shim only accepts loopback requests");
+    return;
+  }
 
   if (req.method === "GET" && path === "/healthz") {
     res.writeHead(200, { "content-type": "application/json" });
@@ -795,9 +929,12 @@ const server = http.createServer(async (req, res) => {
     let body;
     try {
       body = JSON.parse(await readBody(req));
-    } catch {
-      res.writeHead(400, { "content-type": "application/json" });
-      res.end(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "invalid JSON body" } }));
+    } catch (e) {
+      sendError(res, e.status ?? 400, e.type ?? "invalid_request_error", e.status ? e.message : "invalid JSON body");
+      return;
+    }
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      sendError(res, 400, "invalid_request_error", "request body must be a JSON object");
       return;
     }
 
@@ -824,11 +961,15 @@ const server = http.createServer(async (req, res) => {
       emitTurn(res, conv, turn, wantStream);
     } catch (e) {
       log("request failed:", e?.stack ?? e);
+      const status = e?.status ?? 500;
+      const type = e?.type ?? "api_error";
+      const message = String(e?.message ?? e);
       if (!res.headersSent) {
-        res.writeHead(500, { "content-type": "application/json" });
-        res.end(JSON.stringify({ type: "error", error: { type: "api_error", message: String(e?.message ?? e) } }));
+        sendError(res, status, type, message);
       } else {
-        res.end();
+        // The SSE head is already out; the stream's own error event is the
+        // only way the caller learns why it ended.
+        res.end(`event: error\ndata: ${JSON.stringify({ type: "error", error: { type, message } })}\n\n`);
       }
     } finally {
       if (heartbeat) clearInterval(heartbeat);

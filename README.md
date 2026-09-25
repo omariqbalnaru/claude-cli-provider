@@ -32,8 +32,10 @@ pi install <this-package>
 # Command Code
 cmd mods add -g <this-package>
 
-# OpenCode — merge this block into ~/.config/opencode/opencode.json (or project opencode.json)
-claude-shim models opencode > ~/.config/opencode/opencode.json
+# OpenCode — print the provider block, then merge it by hand into
+# ~/.config/opencode/opencode.json (or project opencode.json). Don't redirect
+# onto the file: that replaces your whole config.
+claude-shim models opencode
 ```
 
 OMP and pi load `src/extension.ts` (both read the `pi.extensions` key).

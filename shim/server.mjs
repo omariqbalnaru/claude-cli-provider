@@ -50,7 +50,6 @@ const MCP_SERVER_NAME = "cctools";
 const MCP_PREFIX = `mcp__${MCP_SERVER_NAME}__`;
 
 const log = (...a) => console.error("[claude-shim]", new Date().toISOString().slice(11, 23), ...a);
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const HERE = dirname(fileURLToPath(import.meta.url));
 
 // ---- helpers ---------------------------------------------------------------
@@ -127,7 +126,11 @@ function convKey(model, system, messages, sessionId) {
 // per-request context there (OMP's date and cwd, OpenCode's mode notes), and
 // it must not make the same message look different between requests.
 function ownText(content) {
-  return textOf(userBlocks(content).filter((b) => b.type === "text" && !b.text.trimStart().startsWith("<system-reminder>")));
+  return userBlocks(content)
+    .filter((b) => b.type === "text")
+    .map((b) => b.text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, ""))
+    .filter(Boolean)
+    .join("\n");
 }
 
 // A user message's own input as Anthropic blocks: text and images, minus
@@ -204,6 +207,9 @@ async function handleInternalToolcall(req, res) {
   let body;
   try {
     body = JSON.parse(await readBody(req));
+    if (!body || typeof body.conv !== "string" || typeof body.id !== "string" || !body.id) {
+      throw new Error("invalid bridge request");
+    }
   } catch {
     res.writeHead(400, { "content-type": "application/json" });
     res.end(JSON.stringify({ text: "(bridge sent an unreadable request)" }));
@@ -229,8 +235,8 @@ async function handleInternalToolcall(req, res) {
   // Resolves with { content, isError } for a real result, { text } otherwise.
   const reply = await new Promise((resolve) => {
     conv.parked.set(id, resolve);
-    req.on("close", () => {
-      // The bridge child died (conversation teardown kills the whole tree).
+    res.on("close", () => {
+      // Response closure, not request-body completion, means the bridge left.
       if (conv.parked.get(id) === resolve) {
         conv.parked.delete(id);
         bridgeGone = true;
@@ -287,19 +293,21 @@ const STRIPPED_ENV = [
 ];
 const strippedEnv = (k) => STRIPPED_ENV.includes(k) || k.startsWith("ANTHROPIC_");
 
+function toolDefinitions(tools) {
+  return (tools ?? []).map((t) => ({
+    name: t.name,
+    description: t.description ?? "",
+    inputSchema: t.input_schema ?? { type: "object", properties: {} },
+  }));
+}
+
 function createConversation({ key, system, tools, model, effort }) {
   const q = makeQueue();
   const parked = new Map(); // toolUseId -> resolve({ content, isError } | { text })
   const early = new Map(); // toolUseId -> reply that arrived before its call
 
   const tempDir = mkdtempSync(join(tmpdir(), "claude-shim-conv-"));
-  const defs = (tools ?? [])
-    .filter((t) => t && typeof t.name === "string")
-    .map((t) => ({
-      name: t.name,
-      description: t.description ?? "",
-      inputSchema: t.input_schema ?? { type: "object", properties: {} },
-    }));
+  const defs = toolDefinitions(tools);
   const toolsFile = join(tempDir, "tools.json");
   const sysFile = join(tempDir, "system-prompt.txt");
   const mcpFile = join(tempDir, "mcp-config.json");
@@ -387,6 +395,7 @@ function createConversation({ key, system, tools, model, effort }) {
 
   const conv = {
     q, child, parked, early, model: sdkModel, effort, last: Date.now(), tempDir,
+    tools: stableJson(defs),
     record: [], // fingerprints of the history the child has seen, reply included
     pending: [], // tool_use ids of the last reply, awaiting the caller's results
     busy: false, aborted: false, _abortWait: null,
@@ -495,19 +504,24 @@ async function nextTurn(conv) {
   let ended = false;
   let error = null; // CLI-reported API failure: { kind, message }
   let usage = null; // the last model call's, as the CLI reports it
+  let model = null; // Actual answering model; the CLI may fall back mid-session.
   const deadline = Date.now() + TURN_TIMEOUT_MS;
   while (Date.now() < deadline) {
     // The deadline is only checked between messages, so a wedged child that
     // emits nothing would block q.next() — and this request — forever. Race
     // the wait against the remaining time explicitly.
-    const winner = await Promise.race([
-      conv.q.next().then((msg) => ({ msg })),
-      sleep(deadline - Date.now()).then(() => null),
-      new Promise((resolve) => {
-        conv._abortWait = resolve;
-      }),
-    ]);
-    conv._abortWait = null;
+    let timer;
+    let winner;
+    try {
+      winner = await Promise.race([
+        conv.q.next().then((msg) => ({ msg })),
+        new Promise((resolve) => { timer = setTimeout(() => resolve(null), Math.max(0, deadline - Date.now())); }),
+        new Promise((resolve) => { conv._abortWait = resolve; }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+      conv._abortWait = null;
+    }
     if (!winner) {
       timedOut = true;
       break;
@@ -547,6 +561,7 @@ async function nextTurn(conv) {
     }
     if (msg.type === "assistant") {
       const content = msg.message?.content;
+      if (msg.message?.model) model = msg.message.model;
       if (msg.message?.usage) usage = msg.message.usage;
       if (Array.isArray(content)) {
         for (const b of content) {
@@ -584,29 +599,24 @@ async function nextTurn(conv) {
   if (timedOut) log(`turn timed out after ${TURN_TIMEOUT_MS}ms with no child message`);
   if (aborted) log("turn aborted (client disconnect or conversation teardown)");
   if (error) log(`turn failed: ${error.kind}: ${error.message.slice(0, 200)}`);
-  return { blocks, stopReason: stopReason ?? "end_turn", timedOut, aborted, hadResult, ended, error, usage };
+  return { blocks, model, stopReason: stopReason ?? "end_turn", timedOut, aborted, hadResult, ended, error, usage };
 }
 
-// Render the caller's history as ONE prompt for a fresh child. The child knows
-// nothing (its own context died with the old conversation), so the whole
-// visible conversation is replayed and the model answers the final message in
-// context. Earlier text is capped to keep a big session from costing more than
-// it must; the final message is the one being answered, so it goes through
-// whole. Images stay image blocks. A lone opening message goes verbatim.
+// Render the caller's complete visible history as ONE prompt for a fresh child.
+// Images stay image blocks. A lone opening message goes verbatim.
 function renderTranscript(messages) {
   if (messages.length === 1 && messages[0].role === "user") return userBlocks(messages[0].content);
   const out = []; // strings and image blocks, in order
-  for (const [i, m] of messages.entries()) {
-    const cap = (s) => (i < messages.length - 1 && s.length > 4000 ? s.slice(0, 4000) + "…[truncated]" : s);
+  for (const m of messages) {
     const who = m.role === "user" ? "User" : "Assistant";
     const blocks = typeof m.content === "string" ? [{ type: "text", text: m.content }] : Array.isArray(m.content) ? m.content : [];
     for (const b of blocks) {
-      if (b?.type === "text" && b.text) out.push(`${who}: ${cap(b.text)}`);
+      if (b?.type === "text" && b.text) out.push(`${who}: ${b.text}`);
       else if (b?.type === "image" && b.source) out.push(`${who} attached an image:`, { type: "image", source: b.source });
-      else if (b?.type === "tool_use") out.push(`Assistant called tool ${b.name} with ${cap(JSON.stringify(b.input ?? {}))}`);
+      else if (b?.type === "tool_use") out.push(`Assistant called tool ${b.name} with ${JSON.stringify(b.input ?? {})}`);
       else if (b?.type === "tool_result") {
         out.push(`Tool result${b.is_error ? " (error)" : ""}:`);
-        for (const r of toolResultBlocks(b)) out.push(r.type === "image" ? r : cap(r.text));
+        for (const r of toolResultBlocks(b)) out.push(r.type === "image" ? r : r.text);
       }
     }
   }
@@ -623,15 +633,30 @@ function renderTranscript(messages) {
 
 const sha1 = (s) => crypto.createHash("sha1").update(s).digest("hex");
 
-// A message's identity across requests. Clients rewrite old tool_result
-// content (OMP and OpenCode prune superseded outputs), strip old images (OMP)
-// and re-serialize assistant text and thinking, so none of that takes part.
-// Role, user text and tool ids are stable in pi, OMP and @ai-sdk/anthropic.
+function stableJson(value) {
+  return JSON.stringify(value, (_, v) =>
+    v && typeof v === "object" && !Array.isArray(v)
+      ? Object.fromEntries(Object.keys(v).sort().map((key) => [key, v[key]]))
+      : v,
+  );
+}
+
+// Ignore rewritten historical tool outputs, removed images, and thinking.
+// Assistant text tolerates string/block serialization and edge whitespace;
+// substantive text and tool-call edits must rebuild the child's stale context.
 function fingerprint(m) {
   const blocks = Array.isArray(m?.content) ? m.content : [];
-  if (m?.role === "assistant") return "a:" + blocks.filter((b) => b?.type === "tool_use").map((b) => b.id).join(",");
+  if (m?.role === "assistant") {
+    const calls = blocks.filter((b) => b?.type === "tool_use")
+      .map((b) => ({ id: b.id, name: stripMcp(b.name), input: b.input ?? {} }));
+    return "a:" + sha1(stableJson({ text: textOf(m.content).trim(), calls }));
+  }
   const results = blocks.filter((b) => b?.type === "tool_result").map((b) => b.tool_use_id).join(",");
-  return `${m?.role}:${sha1(ownText(m?.content))}:${results}`;
+  const own = ownText(m?.content);
+  const transient = m?.role === "user" && !results &&
+    userBlocks(m.content).every((b) => b.type === "text") &&
+    (!own.trim() || own.trimStart().startsWith("context-mode active."));
+  return `${transient ? "transient" : m?.role}:${sha1(own)}:${results}`;
 }
 
 // How a request continues the live child, or { reason } it cannot. It must
@@ -641,14 +666,12 @@ function fingerprint(m) {
 // user input.
 function continuation(conv, messages, fps) {
   if (conv.q.stale()) return { reason: "child produced a reply nobody requested" };
-  // Walk what the child has seen against the request. A text-only user
-  // message it saw may be missing now: extensions add per-request context
-  // after the latest prompt and leave it out of later requests (pi's
-  // context-mode). Anything else must line up exactly.
+  // Only known transient context-mode notes and reminder-only user messages
+  // may disappear. Ordinary user instructions must still match exactly.
   let j = 0;
   for (const fp of conv.record) {
     if (fps[j] === fp) j++;
-    else if (!/^user:[0-9a-f]+:$/.test(fp)) {
+    else if (!fp.startsWith("transient:")) {
       return { reason: `history diverged at message ${j} (${fp.slice(0, 12)} vs ${String(fps[j]).slice(0, 12)})` };
     }
   }
@@ -701,15 +724,15 @@ async function handleMessages(body, res, headers = {}) {
     throw new Error("conversation already has a request in flight (another client is driving this session)");
   }
 
-  // Reuse the live child only when this request continues exactly what it
-  // has seen. Anything else — an effort change (the CLI fixes --effort at
-  // spawn), undo, edit, fork, a resend, another model's replies — rebuilds it
-  // from the transcript, which replays the caller's whole visible history.
+  // Effort and tool definitions are fixed at child creation. Changes in either,
+  // undo, edit, fork, or resend rebuild from the caller's visible transcript.
   let plan = null;
   if (conv) {
-    plan = requestedEffort && requestedEffort !== conv.effort
+    plan = requestedEffort !== conv.effort
       ? { reason: `effort change ${conv.effort} -> ${requestedEffort}` }
-      : continuation(conv, messages, fps);
+      : stableJson(toolDefinitions(body.tools)) !== conv.tools
+        ? { reason: "tool definitions changed" }
+        : continuation(conv, messages, fps);
     if (plan.reason) {
       log(`${plan.reason}; rebuilding conversation from transcript`);
       destroyConversation(key);
@@ -830,7 +853,7 @@ function emitTurn(res, conv, turn, wantStream) {
     cache_read_input_tokens: u.cache_read_input_tokens ?? 0,
     output_tokens: u.output_tokens ?? 0,
   };
-  const model = conv?.model ?? "claude-sonnet-5";
+  const model = turn.model ?? conv?.model ?? "claude-sonnet-5";
   const content = turn.blocks
     .filter((b) => b.type === "text" || b.type === "thinking" || b.type === "tool_use")
     .map(toApiBlock)
@@ -999,8 +1022,21 @@ const server = http.createServer(async (req, res) => {
       sendError(res, 400, "invalid_request_error", "request body must be a JSON object");
       return;
     }
+    if (!Array.isArray(body.messages) || !body.messages.length || body.messages.some((m) =>
+      !m || !["user", "assistant"].includes(m.role) ||
+      !(typeof m.content === "string" || (Array.isArray(m.content) && m.content.every((b) =>
+        b && typeof b === "object" && typeof b.type === "string" &&
+        (b.type !== "text" || typeof b.text === "string")))))) {
+      sendError(res, 400, "invalid_request_error", "messages must contain user/assistant messages with string or content-block array content");
+      return;
+    }
+    if (body.tools !== undefined && (!Array.isArray(body.tools) || body.tools.some((t) =>
+      !t || typeof t.name !== "string" || !t.name.trim() ||
+      !t.input_schema || typeof t.input_schema !== "object" || Array.isArray(t.input_schema)))) {
+      sendError(res, 400, "invalid_request_error", "tools must be an array of named tools with input_schema objects");
+      return;
+    }
 
-    // Command Code probes with a trivial request first; answer it cheaply.
     // Streaming requests get SSE keepalive comments while the child works —
     // without bytes on the wire, pi's request timeout kills long turns.
     const wantStream = body.stream === true;

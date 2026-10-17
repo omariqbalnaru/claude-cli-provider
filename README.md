@@ -68,13 +68,17 @@ claude-shim models <fmt> [port]        # providers-json | models-yml | models-js
 ```
 
 The log is `${TMPDIR:-/tmp}/claude-shim.log` (what `claude-shim logs` tails).
-It records conversation metadata, never prompt text.
+It records conversation metadata and CLI diagnostics. Treat it as sensitive:
+CLI errors can include request details.
+OMP/pi and Command Code wait for shim readiness before starting a session.
+Startup failures report the log path; Node is required, with no Bun fallback.
 
 | Env var | Default | |
 |---|---|---|
 | `CLAUDE_SHIM_PORT` | `8792` | listen port |
 | `CLAUDE_SHIM_IDLE_MS` | 10 min | idle conversations are closed after this (1 h while waiting on a tool) |
 | `CLAUDE_SHIM_TURN_TIMEOUT_MS` | 15 min | a turn still running after this fails with a 504 |
+| `CLAUDE_SHIM_LOG` | `${TMPDIR:-/tmp}/claude-shim.log` | launcher log path |
 
 ## Requirements
 
@@ -99,6 +103,7 @@ shim/server.mjs     the Anthropic-wire server (spawns `claude -p` per conversati
 shim/mcp-bridge.mjs stdio MCP server serving the caller's tools to the claude child
 src/extension.ts    OMP + pi extension
 src/mod.ts          Command Code mod
+src/launcher.mjs    shared Node startup and health checks
 src/models.ts       typed view of the catalog + renderers
 bin/claude-shim     CLI
 scripts/sync-to-omp.sh  deploy HEAD into OMP's installed copy (dev)
@@ -112,14 +117,14 @@ system prompt + first user message, plus the session id when the client sends
 one (OMP's `x-claude-code-session-id`, pi's `x-session-affinity`), so two
 sessions with the same opening get separate children.
 
-- **Reuse or rebuild.** The shim fingerprints every message the child has seen
-  (user text and tool ids; tool output, images and assistant text are left
-  out because harnesses rewrite them). A request that only adds user messages
-  continues the live child. Anything else — undo, edit, fork, a resend,
-  another model's replies, an effort change — rebuilds the child from a
-  transcript of the whole history and logs `history diverged at message N`.
-  If that line shows up on ordinary turns, a client is serializing history in
-  a way the fingerprint doesn't expect.
+- **Reuse or rebuild.** The shim compares user text, assistant text and tool
+  calls against the live child's history. Tool-output rewrites, stripped
+  images and thinking metadata do not affect matching. Only recognized
+  transient context notes may disappear without rebuilding.
+  History edits, resends, tool-definition changes and effort changes rebuild
+  the child from the visible transcript. Replay preserves full text rather
+  than truncating older blocks at an arbitrary character limit.
+  Rebuild reasons appear in the log.
 - **Tools.** The caller's tools reach the child through an MCP bridge. Every
   parallel call of a model message comes back in one response. Text sent
   alongside tool results (steering) is folded into the running turn as user
@@ -130,9 +135,21 @@ sessions with the same opening get separate children.
 - **Images** in user messages and tool results are passed through.
 - **Usage** is the CLI's real token count, so harnesses can compact on time.
   The child can also compact itself.
+- **Model attribution.** JSON responses and SSE `message_start` report the
+  answering model supplied by the CLI, including automatic fallback models.
+  The requested model is used only when the CLI omits that field; selecting
+  a model does not guarantee the CLI will answer with it.
 - **Errors** (usage limit, auth, prompt too long, overloaded, timeouts) come
   back as Anthropic-style HTTP errors, or an SSE `error` event mid-stream,
   never as an assistant reply.
+- **Request validation.** Malformed message/tool shapes return HTTP 400 before
+  a child is started or SSE headers are sent. Bridge failures reach Claude as
+  tool errors, not successful tool output.
+- **Compatibility limits.** SSE responses are emitted after the model message
+  completes, with keepalives while waiting; this is not token-by-token streaming.
+  Rebuilds flatten conversation roles into a transcript, not native history.
+  API controls such as `max_tokens`, `temperature` and `tool_choice` are not
+  forwarded to the CLI. This is a client adapter, not a complete Messages API.
 
 ## Development
 
@@ -142,9 +159,12 @@ scripts/sync-to-omp.sh    # deploy HEAD into ~/.omp/... and restart the shim whe
 ```
 
 The sync script deploys the last commit, not the working tree, and copies
-`shim/` and `src/`. It restarts the shim only when shim files changed, only if
-the listener runs from the OMP install, and only once no conversation is live
-(it waits up to 2 h). A local post-commit hook can run
+`shim/`, `src/`, `bin/` and package metadata into an existing install. Changed
+dependencies require reinstalling the plugin first. When shim files change,
+the script waits up to 2 h for the installed listener to become idle before
+stopping it and replacing files. Failed health checks, a busy deadline or
+foreign listeners abort deployment. Copying is not atomic; keep the client
+idle during deployment. A local post-commit hook can run
 `scripts/sync-to-omp.sh --hook`, which deploys only on `main`. A fast-forward
 merge doesn't fire post-commit, so run the script by hand after one.
 

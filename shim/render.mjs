@@ -18,6 +18,7 @@ const THINKING_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"];
 export const effortsFor = (id) => EFFORTS_BY_MODEL[id] ?? ["low", "medium", "high"];
 
 export function render(fmt, port = DEFAULT_PORT) {
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("port must be an integer from 1 to 65535");
   const base = `http://127.0.0.1:${port}`;
   if (fmt === "providers-json") {
     return JSON.stringify(
@@ -89,7 +90,7 @@ export function render(fmt, port = DEFAULT_PORT) {
               ]),
               // The shim takes an adaptive `effort`; without this pi sends a
               // thinkingBudgetTokens instead and the effort never reaches it.
-              compat: { forceAdaptiveThinking: true },
+              compat: { forceAdaptiveThinking: true, sendSessionAffinityHeaders: true },
             })),
           },
         },

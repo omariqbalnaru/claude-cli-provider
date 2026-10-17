@@ -16,8 +16,8 @@ const STUB = `#!/usr/bin/env node
 const fs = require("node:fs");
 const rl = require("node:readline").createInterface({ input: process.stdin });
 const out = (m) => process.stdout.write(JSON.stringify(m) + "\\n");
-const say = (text) => {
-  out({ type: "assistant", message: { content: [{ type: "text", text }], stop_reason: "end_turn" } });
+const say = (text, model) => {
+  out({ type: "assistant", message: { model, content: [{ type: "text", text }], stop_reason: "end_turn" } });
   out({ type: "result", subtype: "success" });
 };
 const mcp = JSON.parse(fs.readFileSync(process.argv[process.argv.indexOf("--mcp-config") + 1], "utf8"));
@@ -36,13 +36,14 @@ rl.on("line", async (line) => {
   }
   if (text.includes("ENV")) return say(Object.keys(process.env).join(","));
   if (text.includes("PID")) return say("pid " + process.pid);
-  if (text.includes("ARGS")) return say(JSON.stringify({ argv: process.argv.slice(2), cwd: process.cwd(), files: fs.readdirSync(process.cwd()), memory: process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY }));
+  if (text.includes("ARGS")) return say(JSON.stringify({ pid: process.pid, argv: process.argv.slice(2), tools: JSON.parse(fs.readFileSync(bridge.CLAUDE_BRIDGE_TOOLS, "utf8")), cwd: process.cwd(), files: fs.readdirSync(process.cwd()), memory: process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY }));
+  if (text.includes("FALLBACK")) return say("fallback answer", "claude-opus-4-8");
   if (text.includes("FAIL")) {
     out({ type: "assistant", error: "rate_limit", message: { model: "<synthetic>", content: [{ type: "text", text: "usage limit hit" }], stop_reason: "stop_sequence" } });
     return out({ type: "result", subtype: "success", is_error: true, result: "usage limit hit" });
   }
   if (text.includes("TOOL") && !text.includes("Tool result")) {
-    out({ type: "assistant", message: { content: [{ type: "tool_use", id: "toolu_1", name: "mcp__cctools__echo", input: {} }] } });
+    out({ type: "assistant", message: { content: [{ type: "tool_use", id: "toolu_1", name: "mcp__cctools__echo", input: text.includes("canonical") ? { outer: { b: 2, a: 1 }, list: [1, 2] } : {} }] } });
     out({ type: "stream_event", event: { type: "message_stop" } });
     inTool = true;
     const r = await fetch("http://127.0.0.1:" + bridge.CLAUDE_BRIDGE_PORT + "/internal/toolcall", {
@@ -105,6 +106,41 @@ test("null and non-object bodies are 400, shim survives", async () => {
   assert.equal((await request(msgs(user("hello")))).status, 200);
 });
 
+for (const stream of [false, true]) {
+  test(`malformed messages and tools fail before response streaming (stream=${stream})`, async () => {
+    const invalid = [
+      ["missing messages", {}],
+      ["empty messages", { messages: [] }],
+      ["non-array messages", { messages: {} }],
+      ["null message", { messages: [null] }],
+      ["invalid role", { messages: [{ role: "system", content: "x" }] }],
+      ["null content", { messages: [user(null)] }],
+      ["null block", { messages: [user([null])] }],
+      ["missing block type", { messages: [user([{ text: "x" }])] }],
+      ["missing text", { messages: [user([{ type: "text" }])] }],
+      ["non-string text", { messages: [user([{ type: "text", text: 1 }])] }],
+      ["non-array tools", { ...msgs(user("invalid tools")), tools: {} }],
+      ["null tools", { ...msgs(user("invalid tools")), tools: null }],
+      ["empty tool name", { ...msgs(user("invalid tools")), tools: [{ name: "", input_schema: {} }] }],
+      ["missing tool schema", { ...msgs(user("invalid tools")), tools: [{ name: "echo" }] }],
+      ["null tool schema", { ...msgs(user("invalid tools")), tools: [{ name: "echo", input_schema: null }] }],
+      ["array tool schema", { ...msgs(user("invalid tools")), tools: [{ name: "echo", input_schema: [] }] }],
+    ];
+    for (const [name, body] of invalid) {
+      const response = await request({ ...body, stream });
+      assert.equal(response.status, 400, name);
+      assert.equal(JSON.parse(response.data).error.type, "invalid_request_error", name);
+      assert.doesNotMatch(response.data, /event: message_start/, name);
+    }
+  });
+}
+
+test("model and tools remain optional", async () => {
+  const response = await request({ messages: [user("optional request fields")] });
+  assert.equal(response.status, 200);
+  assert.match(text(response), /optional request fields/);
+});
+
 test("non-loopback Host or Origin is refused", async () => {
   assert.equal((await request(msgs(user("x")), { host: "evil.example" })).status, 403);
   assert.equal((await request(msgs(user("x")), { origin: "https://evil.example" })).status, 403);
@@ -136,6 +172,18 @@ test("CLI API error becomes an HTTP error, and an SSE error event when streaming
   const s = await request({ ...msgs(user("FAIL stream")), stream: true });
   assert.match(s.data, /event: error\ndata: .*rate_limit_error/);
 });
+
+for (const stream of [false, true]) {
+  test(`fallback reports answering model (stream=${stream})`, async () => {
+    const response = await request({ model: "claude-fable-5-1", messages: [user("FALLBACK")], stream });
+    assert.equal(response.status, 200);
+    const message = stream
+      ? response.data.split("\n").filter((line) => line.startsWith("data: "))
+        .map((line) => JSON.parse(line.slice(6))).find((event) => event.type === "message_start").message
+      : JSON.parse(response.data);
+    assert.equal(message.model, "claude-opus-4-8");
+  });
+}
 
 test("dead child errors the turn, next request gets a fresh child", async () => {
   const first = await request(msgs(user("DIE once")));
@@ -222,6 +270,158 @@ test("a <system-reminder> block that changes between requests does not rebuild",
   const later = user([{ type: "text", text: "<system-reminder>Today: day 2</system-reminder>" }, { type: "text", text: "alpha reminder" }]);
   const r2 = text(await request(msgs(later, { role: "assistant", content: r1.content }, user("beta reminder"))));
   assert.match(r2, /echo: \[\{"type":"text","text":"beta reminder"\}\]/);
+});
+
+test("inline reminder changes preserve reuse without hiding real user edits", async () => {
+  const opening = user("PID inline reminder");
+  const first = JSON.parse((await request(msgs(opening, user("<system-reminder>day 1</system-reminder>keep this rule")))).data);
+  const unchanged = [
+    opening,
+    user("<system-reminder>day 2</system-reminder>keep this rule"),
+    { role: "assistant", content: first.content },
+  ];
+  const second = JSON.parse((await request(msgs(...unchanged, user("PID same rule")))).data);
+  assert.equal(second.content[0].text, first.content[0].text);
+  const edited = await request(msgs(
+    opening,
+    user("<system-reminder>day 3</system-reminder>edited rule"),
+    { role: "assistant", content: first.content },
+    user("PID same rule"),
+    { role: "assistant", content: second.content },
+    user("PID edited rule"),
+  ));
+  assert.notEqual(text(edited), first.content[0].text);
+});
+
+test("a reminder-only message may disappear without rebuilding", async () => {
+  const opening = user("PID disappearing reminder");
+  const first = JSON.parse((await request(msgs(opening, user("<system-reminder>transient context</system-reminder>")))).data);
+  const next = await request(msgs(opening, { role: "assistant", content: first.content }, user("PID next")));
+  assert.equal(text(next), first.content[0].text);
+});
+
+test("deleting an ordinary user message rebuilds the child", async () => {
+  const opening = user("PID deleted instruction");
+  const first = JSON.parse((await request(msgs(opening, user("keep this rule")))).data);
+  const next = await request(msgs(opening, { role: "assistant", content: first.content }, user("PID after deletion")));
+  assert.notEqual(text(next), first.content[0].text);
+});
+
+test("editing assistant text rebuilds from the edited transcript", async () => {
+  const opening = user("assistant edit opening");
+  await request(msgs(opening));
+  const next = await request(msgs(opening, { role: "assistant", content: "edited assistant answer" }, user("continue")));
+  assert.match(text(next), /Assistant: edited assistant answer/);
+  assert.match(text(next), /Continue this conversation/);
+});
+
+test("assistant text string/block serialization and thinking rewrites preserve reuse", async () => {
+  const opening = user("PID assistant serialization");
+  const first = JSON.parse((await request(msgs(opening))).data);
+  const second = JSON.parse((await request(msgs(opening, { role: "assistant", content: ` ${first.content[0].text}\n` }, user("PID string")))).data);
+  const third = await request(msgs(
+    opening,
+    { role: "assistant", content: first.content },
+    user("PID string"),
+    { role: "assistant", content: [{ type: "thinking", thinking: "rewritten", signature: "changed" }, ...second.content] },
+    user("PID blocks"),
+  ));
+  assert.equal(second.content[0].text, first.content[0].text);
+  assert.equal(text(third), first.content[0].text);
+});
+
+for (const field of ["input", "name"]) {
+  test(`editing assistant tool ${field} rebuilds from the edited transcript`, async () => {
+    const opening = user(`TOOL edit ${field}`);
+    const first = JSON.parse((await request(msgs(opening))).data);
+    assert.equal(first.stop_reason, "tool_use");
+    const edited = first.content.map((block) => ({ ...block, [field]: field === "input" ? { changed: true } : "changed_tool" }));
+    const next = await request(msgs(opening, { role: "assistant", content: edited }, user([{ type: "tool_result", tool_use_id: "toolu_1", content: "out" }])));
+    assert.match(text(next), /Continue this conversation/);
+    assert.ok(text(next).includes(field === "input" ? '\\"changed\\":true' : "changed_tool"));
+  });
+}
+
+test("tool input key order and MCP naming preserve the running tool call", async () => {
+  const opening = user("TOOL canonical");
+  const first = JSON.parse((await request(msgs(opening))).data);
+  const equivalent = first.content.map((block) => ({ ...block, name: "mcp__cctools__echo", input: { list: [1, 2], outer: { a: 1, b: 2 } } }));
+  const next = await request(msgs(opening, { role: "assistant", content: equivalent }, user([{ type: "tool_result", tool_use_id: "toolu_1", content: "out" }])));
+  assert.equal(text(next), "tool said: out");
+});
+
+test("rewritten historical tool outputs and removed images preserve reuse", async () => {
+  const opening = user([{ type: "text", text: "TOOL prune output" }, { type: "image", source: IMG }]);
+  const first = JSON.parse((await request(msgs(opening))).data);
+  const assistant = { role: "assistant", content: first.content };
+  const result = JSON.parse((await request(msgs(opening, assistant, user([{ type: "tool_result", tool_use_id: "toolu_1", content: "original output" }])))).data);
+  const next = await request(msgs(
+    user("TOOL prune output"),
+    assistant,
+    user([{ type: "tool_result", tool_use_id: "toolu_1", content: "(old output pruned)" }]),
+    { role: "assistant", content: result.content },
+    user("after pruning"),
+  ));
+  assert.match(text(next), /^echo: \[\{"type":"text","text":"after pruning"\}\]/);
+});
+
+const echoTool = { name: "echo", description: "original description", input_schema: { type: "object", properties: {} } };
+for (const [change, beforeTools, afterTools] of [
+  ["added", [], [echoTool]],
+  ["removed", [echoTool], []],
+  ["renamed", [echoTool], [{ ...echoTool, name: "other" }]],
+  ["description", [echoTool], [{ ...echoTool, description: "new description" }]],
+  ["schema", [echoTool], [{ ...echoTool, input_schema: { type: "object", properties: { value: { type: "string" } } } }]],
+]) {
+  test(`tool definitions ${change} rebuild and reach the new child`, async () => {
+    const opening = user(`ARGS tools ${change}`);
+    const first = JSON.parse((await request({ ...msgs(opening), tools: beforeTools })).data);
+    const prior = JSON.parse(first.content[0].text);
+    const next = JSON.parse(text(await request({ ...msgs(opening, { role: "assistant", content: first.content }, user("ARGS next")), tools: afterTools })));
+    assert.notEqual(next.pid, prior.pid);
+    assert.deepEqual(next.tools, afterTools.map((tool) => ({ name: tool.name, description: tool.description, inputSchema: tool.input_schema })));
+  });
+}
+
+test("equivalent tool schema key order preserves reuse", async () => {
+  const opening = user("ARGS equivalent tools");
+  const first = JSON.parse((await request({ ...msgs(opening), tools: [echoTool] })).data);
+  const next = JSON.parse(text(await request({
+    ...msgs(opening, { role: "assistant", content: first.content }, user("ARGS next")),
+    tools: [{ input_schema: { properties: {}, type: "object" }, description: "original description", name: "echo" }],
+  })));
+  assert.equal(next.pid, JSON.parse(first.content[0].text).pid);
+});
+
+for (const source of ["effort", "output_config", "suffix"]) {
+  test(`removing explicit ${source} effort rebuilds with the CLI default`, async () => {
+    const opening = user(`ARGS reset ${source}`);
+    const configured = source === "suffix"
+      ? { ...msgs(opening), model: "claude-sonnet-5:high" }
+      : { ...msgs(opening), ...(source === "effort" ? { effort: "high" } : { output_config: { effort: "high" } }) };
+    const first = JSON.parse((await request(configured)).data);
+    const prior = JSON.parse(first.content[0].text);
+    assert.equal(prior.argv[prior.argv.indexOf("--effort") + 1], "high");
+    const next = JSON.parse(text(await request(msgs(opening, { role: "assistant", content: first.content }, user("ARGS default")))));
+    assert.notEqual(next.pid, prior.pid);
+    assert.ok(!next.argv.includes("--effort"));
+  });
+}
+
+test("rebuild replays complete earlier text, tool input, and tool output", async () => {
+  const userText = "U".repeat(4500) + "USER_END";
+  const assistantText = "A".repeat(4500) + "ASSISTANT_END";
+  const toolInput = "I".repeat(4500) + "INPUT_END";
+  const toolOutput = "O".repeat(4500) + "OUTPUT_END";
+  const response = await request(msgs(
+    user(userText),
+    { role: "assistant", content: [{ type: "text", text: assistantText }, { type: "tool_use", id: "old", name: "echo", input: { value: toolInput } }] },
+    user([{ type: "tool_result", tool_use_id: "old", content: toolOutput }]),
+    { role: "assistant", content: "done" },
+    user("continue replay"),
+  ));
+  for (const complete of [userText, assistantText, toolInput, toolOutput]) assert.ok(text(response).includes(complete));
+  assert.doesNotMatch(text(response), /truncated/);
 });
 
 test("the same opening in two sessions gets two children", async () => {

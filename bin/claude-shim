@@ -27,40 +27,75 @@ HERE="$(cd "$(dirname "$SOURCE")" && pwd)"
 SHIM_DIR="$HERE/../shim"
 PORT="${CLAUDE_SHIM_PORT:-8792}"
 LOG="${CLAUDE_SHIM_LOG:-${TMPDIR:-/tmp}/claude-shim.log}"
+export CLAUDE_SHIM_PORT="$PORT"
+
+require_node() {
+  command -v node >/dev/null || { echo "claude-shim requires Node.js on PATH (Bun cannot cancel disconnected turns)" >&2; exit 1; }
+  node -e 'const p=Number(process.argv[1]);if(!Number.isInteger(p)||p<1||p>65535){console.error("CLAUDE_SHIM_PORT must be an integer from 1 to 65535");process.exit(1)}' "$PORT"
+}
+
+require_lsof() {
+  command -v lsof >/dev/null || { echo "claude-shim requires lsof on PATH" >&2; exit 1; }
+}
+
+healthy() {
+  curl -fsS --max-time 1 "http://127.0.0.1:$PORT/healthz" 2>/dev/null |
+    node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{try{const h=JSON.parse(s);process.exit(h.ok===true&&Number.isSafeInteger(h.conversations)&&h.conversations>=0?0:1)}catch{process.exit(1)}})'
+}
 
 listener_pid() {
-  lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1
+  local pids
+  pids="$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null || true)"
+  printf '%s\n' "${pids%%$'\n'*}"
 }
 
 case "${1:-start}" in
   models)
+    require_node
     exec node "$SHIM_DIR/server.mjs" models "${2:-providers-json}" "${3:-$PORT}"
     ;;
   start)
+    require_node
+    require_lsof
     if [ -n "$(listener_pid)" ]; then
-      echo "claude-shim already listening on :$PORT"
-      exit 0
+      if healthy; then
+        echo "claude-shim already listening on :$PORT"
+        exit 0
+      fi
+      echo "port :$PORT is occupied by an unhealthy or non-shim listener; refusing to start" >&2
+      exit 1
     fi
     echo "starting claude-shim on :$PORT ..."
     # Detach with a real login environment (Keychain auth needs it), and keep
     # the log private: the shim logs conversation metadata.
     umask 077
-    USER="${USER:-$(id -un)}" LOGNAME="${LOGNAME:-$(id -un)}" \
-    SHELL="${SHELL:-/bin/sh}" TMPDIR="${TMPDIR:-/tmp}" \
-      nohup node "$SHIM_DIR/server.mjs" >>"$LOG" 2>&1 &
+    (
+      cd "$SHIM_DIR"
+      export USER="${USER:-$(id -un)}" LOGNAME="${LOGNAME:-$(id -un)}"
+      export SHELL="${SHELL:-/bin/sh}" TMPDIR="${TMPDIR:-/tmp}"
+      exec nohup node server.mjs >>"$LOG" 2>&1
+    ) &
+    pid=$!
     for _ in $(seq 40); do
-      if curl -sf -o /dev/null "http://127.0.0.1:$PORT/healthz" 2>/dev/null; then
+      if healthy; then
         echo "claude-shim up: http://127.0.0.1:$PORT/v1"
         exit 0
       fi
+      kill -0 "$pid" 2>/dev/null || break
       sleep 0.25
     done
     echo "shim failed to come up; see $LOG" >&2
     exit 1
     ;;
   stop)
+    require_node
+    require_lsof
     pid="$(listener_pid)"
     if [ -n "$pid" ]; then
+      if ! healthy; then
+        echo "listener on :$PORT is not a healthy claude-shim; refusing to stop pid $pid" >&2
+        exit 1
+      fi
       echo "stopping claude-shim (pid $pid)"
       kill "$pid" 2>/dev/null || true
     else
@@ -68,9 +103,10 @@ case "${1:-start}" in
     fi
     ;;
   status)
-    if [ -n "$(listener_pid)" ]; then
+    require_node
+    if healthy; then
       echo "claude-shim :$PORT -> up"
-      curl -s "http://127.0.0.1:$PORT/v1/models" \
+      curl -fsS --max-time 2 "http://127.0.0.1:$PORT/v1/models" \
         | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>console.log("models exposed:",JSON.parse(s).data.length))'
     else
       echo "claude-shim :$PORT -> DOWN"

@@ -13,18 +13,9 @@
  * file touches is declared locally.
  */
 
-import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { createAnthropic } from "@ai-sdk/anthropic";
-import { MODELS, PROVIDER_ID, PROVIDER_NAME, DEFAULT_PORT } from "./models.ts";
-
-const HERE = dirname(fileURLToPath(import.meta.url));
-const SHIM = join(HERE, "..", "shim", "server.mjs");
-const PORT = Number(process.env.CLAUDE_SHIM_PORT ?? DEFAULT_PORT);
-const BASE = `http://127.0.0.1:${PORT}`;
+import { MODELS, PROVIDER_ID, PROVIDER_NAME } from "./models.ts";
+import { BASE, ensureShim } from "./launcher.mjs";
 
 interface Disposable {
   dispose(): void;
@@ -33,46 +24,6 @@ interface Disposable {
 interface ModApi {
   addProvider(module: unknown): Disposable;
   hooks(hooks: { onSessionStart?: () => void | Promise<void> }): Disposable;
-}
-
-async function shimUp(): Promise<boolean> {
-  try {
-    const res = await fetch(`${BASE}/healthz`, { signal: AbortSignal.timeout(500) });
-    return res.ok;
-  } catch {
-    return false;
-  }
-}
-
-function bootShim(): void {
-  if (!existsSync(SHIM)) return;
-  // Detached so the shim outlives the session, and with a real login env:
-  // Claude Code's Keychain-backed auth needs USER/LOGNAME/SHELL/TMPDIR.
-  // Run it under node, not the host's runtime. Under bun, node:http never
-  // reports a client disconnect, so the shim cannot abort a turn the user
-  // cancelled; and a bun-compiled host's execPath is not a JS runtime at all.
-  // No node on PATH: fall back to the host, told to behave as plain bun.
-  const start = (cmd: string, extraEnv: Record<string, string> = {}) => {
-    const child = spawn(cmd, [SHIM], {
-      cwd: join(HERE, "..", "shim"),
-      detached: true,
-      stdio: "ignore",
-      env: {
-        ...process.env,
-        USER: process.env.USER || process.env.LOGNAME || "user",
-        LOGNAME: process.env.LOGNAME || process.env.USER || "user",
-        SHELL: process.env.SHELL || "/bin/sh",
-        TMPDIR: process.env.TMPDIR || "/tmp",
-        HOME: process.env.HOME || homedir(),
-        ...extraEnv,
-      },
-    });
-    child.on("error", () => {
-      if (cmd === "node") start(process.execPath, { BUN_BE_BUN: "1" });
-    });
-    child.unref();
-  };
-  start(process.versions.bun ? "node" : process.execPath);
 }
 
 export default function (cmd: ModApi): void {
@@ -100,11 +51,5 @@ export default function (cmd: ModApi): void {
     // the shim owns authentication (via Claude Code), so cmd must send none.
   });
 
-  cmd.hooks({
-    onSessionStart: () => {
-      void shimUp().then((up) => {
-        if (!up) bootShim();
-      });
-    },
-  });
+  cmd.hooks({ onSessionStart: ensureShim });
 }

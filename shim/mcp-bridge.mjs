@@ -52,7 +52,7 @@ async function callTool(msg) {
     req.end(body);
   });
   const blocks = reply.content ?? [{ type: "text", text: reply.text ?? "(empty tool result)" }];
-  return { content: blocks.map(toMcp), ...(reply.isError && { isError: true }) };
+  return { content: blocks.map(toMcp), ...((reply.isError || !reply.content) && { isError: true }) };
 }
 
 // Anthropic content block -> MCP content item. MCP images carry base64 only.

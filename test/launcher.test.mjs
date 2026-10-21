@@ -113,6 +113,35 @@ test("CLI stop succeeds when no process listens", (t) => {
   assert.match(result.stdout, /nothing listening/);
 });
 
+test("CLI config merge writes the provider block into a config", (t) => {
+  const dir = fixture(t);
+  const config = join(dir, "opencode.jsonc");
+  writeFileSync(config, '{\n  // a comment\n  "providers": {\n    "claude-cli": { "name": "old" }\n  }\n}\n');
+  const result = spawnSync("/bin/bash", [join(ROOT, "bin/claude-shim"), "config", "merge", "opencode", "--config", config], {
+    env: { ...process.env, PATH: `${dir}:${process.env.PATH}` },
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /updated/);
+  const merged = readFileSync(config, "utf8");
+  assert.match(merged, /\/\/ a comment/, "the comment survives");
+  assert.match(merged, /"name": "Claude CLI"/, "the block is the rendered one");
+});
+
+test("CLI config merge --dry-run leaves the config alone", (t) => {
+  const dir = fixture(t);
+  const config = join(dir, "opencode.jsonc");
+  const before = '{\n  "providers": {}\n}\n';
+  writeFileSync(config, before);
+  const result = spawnSync("/bin/bash", [join(ROOT, "bin/claude-shim"), "config", "merge", "opencode", "--config", config, "--dry-run"], {
+    env: { ...process.env, PATH: `${dir}:${process.env.PATH}` },
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /would update/);
+  assert.equal(readFileSync(config, "utf8"), before);
+});
+
 test("CLI start runs from shim directory so deployment can identify it", async (t) => {
   const { dir } = await launcher(t, `
     import http from "node:http";

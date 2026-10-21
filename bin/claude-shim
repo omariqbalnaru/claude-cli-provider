@@ -58,11 +58,13 @@ case "${1:-start}" in
     ;;
   config)
     require_node
-    if [ "${2:-}" != "merge" ]; then
+    if [ "${2:-}" != "merge" ] || [ "${3:-}" != "opencode" ]; then
       echo "usage: claude-shim config merge opencode [--dry-run] [--config PATH]" >&2
       exit 2
     fi
-    shift 2
+    # Drop "config merge opencode": the target is fixed, so only the flags
+    # that follow are for the merge command.
+    shift 3
     exec node "$SHIM_DIR/merge.mjs" opencode --port "$PORT" "$@"
     ;;
   start)

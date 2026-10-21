@@ -42,6 +42,10 @@ cmd mods add -g <this-package>
 claude-shim models opencode
 ```
 
+The provider label is short on purpose: opencode's model picker renders it as
+the row's right-hand column, which never shrinks, so a long label clips the
+model name beside it. `test/picker.test.mjs` holds that fit.
+
 OMP and pi load `src/extension.ts` (both read the `pi.extensions` key).
 Command Code loads `src/mod.ts` (the `commandcode.mods` key).
 

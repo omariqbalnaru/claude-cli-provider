@@ -31,7 +31,7 @@ test("opencode models expand every catalog model with its effort variants", () =
     for (const effort of effortsFor(m.id)) {
       assert.deepEqual(
         models[`${m.id}:${effort}`],
-        { name: `${m.name} (${effort} effort)`, limit: { context: m.context, output: m.out } },
+        { name: `${m.name} (${effort})`, limit: { context: m.context, output: m.out } },
         `${m.id}:${effort}`,
       );
     }

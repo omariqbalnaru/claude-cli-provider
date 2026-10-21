@@ -4,10 +4,9 @@
  * shared catalog (models.mjs) into each harness's hand-written config shape.
  */
 
-import { MODELS, DEFAULT_PORT, EFFORTS_BY_MODEL } from "./models.mjs";
+import { MODELS, DEFAULT_PORT, EFFORTS_BY_MODEL, PROVIDER_ID, PROVIDER_NAME } from "./models.mjs";
 
-export const PROVIDER_ID = "claude-cli";
-export const PROVIDER_NAME = "Claude (Pro/Max via claude CLI)";
+export { PROVIDER_ID, PROVIDER_NAME };
 
 /** Thinking efforts each model accepts — single source of truth in models.mjs. */
 export { EFFORTS_BY_MODEL };
@@ -127,7 +126,9 @@ export function render(fmt, port = DEFAULT_PORT) {
                 [m.id, { name: m.name, limit: { context: m.context, output: m.out } }],
                 ...effortsFor(m.id).map((e) => [
                   `${m.id}:${e}`,
-                  { name: `${m.name} (${e} effort)`, limit: { context: m.context, output: m.out } },
+                  // "(low)", not "(low effort)": the picker gives the model name
+                  // only the cells the provider label leaves over.
+                  { name: `${m.name} (${e})`, limit: { context: m.context, output: m.out } },
                 ]),
               ]),
             ),

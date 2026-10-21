@@ -53,7 +53,13 @@ export const EFFORTS_BY_MODEL = {
 };
 
 export const PROVIDER_ID = "claude-cli";
-export const PROVIDER_NAME = "Claude (Pro/Max via claude CLI)";
+/**
+ * Short on purpose: opencode's model picker renders the provider name as the
+ * row's footer, which never shrinks, and the model name beside it is the only
+ * flexible cell — a long provider label clips the model name it is supposed
+ * to sit next to. test/picker.test.mjs holds the fit.
+ */
+export const PROVIDER_NAME = "Claude CLI";
 export const DEFAULT_PORT = 8792;
 
 /**

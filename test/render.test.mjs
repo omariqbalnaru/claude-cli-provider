@@ -1,7 +1,7 @@
 // Renderer shapes — plain, no server, no stub CLI needed. Run: node --test test/
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { MODELS } from "../shim/models.mjs";
+import { ALIAS_MODELS } from "../shim/models.mjs";
 import { effortsFor, render } from "../shim/render.mjs";
 
 const opencode = (port) => JSON.parse(render("opencode", port));
@@ -24,9 +24,9 @@ test("opencode block uses the v2 providers shape", () => {
   assert.equal(provider.options, undefined);
 });
 
-test("opencode models expand every catalog model with its effort variants", () => {
+test("opencode models expand every alias with its effort variants", () => {
   const { models } = opencode().providers["claude-cli"];
-  for (const m of MODELS) {
+  for (const m of ALIAS_MODELS) {
     assert.deepEqual(models[m.id], { name: m.name, limit: { context: m.context, output: m.out } }, m.id);
     for (const effort of effortsFor(m.id)) {
       assert.deepEqual(
@@ -36,9 +36,22 @@ test("opencode models expand every catalog model with its effort variants", () =
       );
     }
   }
-  const expected = MODELS.reduce((n, m) => n + 1 + effortsFor(m.id).length, 0);
+  const expected = ALIAS_MODELS.reduce((n, m) => n + 1 + effortsFor(m.id).length, 0);
   assert.equal(Object.keys(models).length, expected);
   for (const entry of Object.values(models)) assert.equal(entry.reasoning, undefined);
+});
+
+test("the opencode picker offers the latest generation only", () => {
+  const { models } = opencode().providers["claude-cli"];
+  // Every entry is an alias, which the CLI resolves to the newest release of
+  // its family at spawn time: a pinned version would be a superseded one.
+  for (const id of Object.keys(models)) {
+    const base = id.split(":")[0];
+    assert.ok(
+      ALIAS_MODELS.some((m) => m.id === base),
+      `${id} is not one of the aliases (${ALIAS_MODELS.map((m) => m.id).join(", ")})`,
+    );
+  }
 });
 
 test("opencode port override relays into baseURL", () => {

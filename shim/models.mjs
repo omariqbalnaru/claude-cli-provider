@@ -30,6 +30,15 @@ export const MODELS = [
   { id: "claude-haiku-4-5", name: "Claude Haiku 4.5", context: 200_000, out: 64_000 },
 ];
 
+/**
+ * The models the picker offers: the CLI's unpinned aliases. Each resolves to
+ * the newest release of its family at spawn time, so the picker tracks the
+ * CLI without a catalog edit and never shows a superseded version. The
+ * pinned versions stay in the catalog for the /v1/models listing and for the
+ * freshness gate that compares the CLI's bundle against them.
+ */
+export const ALIAS_MODELS = MODELS.filter((model) => model.cli);
+
 /** Thinking efforts each model accepts, least → most intensive. */
 export const EFFORTS_BY_MODEL = {
   "claude-sonnet-5-5": ["low", "medium", "high", "xhigh", "max"],

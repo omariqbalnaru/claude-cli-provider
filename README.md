@@ -46,6 +46,12 @@ The provider label is short on purpose: opencode's model picker renders it as
 the row's right-hand column, which never shrinks, so a long label clips the
 model name beside it. `test/picker.test.mjs` holds that fit.
 
+The opencode block offers the CLI's **aliases only** — `Claude Opus (latest)`
+and its effort variants. Each resolves to the newest release of its family at
+spawn time, so the picker never shows a superseded version and follows the
+CLI when Anthropic ships one. The pinned versions stay in the `/v1/models`
+listing for clients that want an exact version.
+
 OMP and pi load `src/extension.ts` (both read the `pi.extensions` key).
 Command Code loads `src/mod.ts` (the `commandcode.mods` key).
 

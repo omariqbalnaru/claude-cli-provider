@@ -4,7 +4,7 @@
  * shared catalog (models.mjs) into each harness's hand-written config shape.
  */
 
-import { MODELS, DEFAULT_PORT, EFFORTS_BY_MODEL, PROVIDER_ID, PROVIDER_NAME } from "./models.mjs";
+import { MODELS, ALIAS_MODELS, DEFAULT_PORT, EFFORTS_BY_MODEL, PROVIDER_ID, PROVIDER_NAME } from "./models.mjs";
 
 export { PROVIDER_ID, PROVIDER_NAME };
 
@@ -122,7 +122,9 @@ export function render(fmt, port = DEFAULT_PORT) {
               chunkTimeout: false,
             },
             models: Object.fromEntries(
-              MODELS.flatMap((m) => [
+              // The aliases only: each resolves to the newest release of its
+              // family, so the picker never offers a superseded version.
+              ALIAS_MODELS.flatMap((m) => [
                 [m.id, { name: m.name, limit: { context: m.context, output: m.out } }],
                 ...effortsFor(m.id).map((e) => [
                   `${m.id}:${e}`,

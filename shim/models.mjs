@@ -14,6 +14,7 @@ export const MODELS = [
   { id: "claude-sonnet", name: "Claude Sonnet (latest)", cli: "sonnet", context: 1_000_000, out: 128_000 },
   { id: "claude-fable", name: "Claude Fable (latest)", cli: "fable", context: 1_000_000, out: 128_000 },
   { id: "claude-haiku", name: "Claude Haiku (latest)", cli: "haiku", context: 200_000, out: 64_000 },
+  { id: "claude-sonnet-5-5", name: "Claude Sonnet 5.5", context: 1_000_000, out: 128_000 },
   { id: "claude-opus-5-5", name: "Claude Opus 5.5", context: 1_000_000, out: 128_000 },
   { id: "claude-opus-5", name: "Claude Opus 5", context: 1_000_000, out: 128_000 },
   { id: "claude-sonnet-5", name: "Claude Sonnet 5", context: 1_000_000, out: 128_000 },
@@ -30,6 +31,7 @@ export const MODELS = [
 
 /** Thinking efforts each model accepts, least → most intensive. */
 export const EFFORTS_BY_MODEL = {
+  "claude-sonnet-5-5": ["low", "medium", "high", "xhigh", "max"],
   "claude-opus-5-5": ["low", "medium", "high", "xhigh", "max"],
   "claude-opus": ["low", "medium", "high", "xhigh", "max"],
   "claude-sonnet": ["low", "medium", "high", "xhigh", "max"],

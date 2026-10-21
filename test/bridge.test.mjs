@@ -11,12 +11,15 @@ import { join } from "node:path";
 test("bridge reports shim aborts as tool errors, preserves successful results", async () => {
   const dir = await mkdtemp(join(tmpdir(), "bridge-test-"));
   await writeFile(join(dir, "tools.json"), "[]");
+  /** @type {any} The bridge's reply shape varies per case, so the type stays open. */
   let reply = { text: "(tool call aborted: session ended)" };
   const server = http.createServer((req, res) => { req.resume(); res.end(JSON.stringify(reply)); });
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
+  const address = server.address();
+  const port = typeof address === "object" && address ? address.port : 0;
   const child = spawn(process.execPath, ["shim/mcp-bridge.mjs"], {
-    env: { ...process.env, CLAUDE_BRIDGE_PORT: String(server.address().port), CLAUDE_BRIDGE_TOOLS: join(dir, "tools.json"), CLAUDE_BRIDGE_CONV: "test" },
+    env: { ...process.env, CLAUDE_BRIDGE_PORT: String(port), CLAUDE_BRIDGE_TOOLS: join(dir, "tools.json"), CLAUDE_BRIDGE_CONV: "test" },
     stdio: ["pipe", "pipe", "inherit"],
   });
   const lines = createInterface({ input: child.stdout })[Symbol.asyncIterator]();

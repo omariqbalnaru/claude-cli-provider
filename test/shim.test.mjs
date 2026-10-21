@@ -66,15 +66,30 @@ rl.on("line", async (line) => {
 writeFileSync(join(dir, "claude"), STUB);
 chmodSync(join(dir, "claude"), 0o755);
 
+/** A free port: the server binds to 0 and the OS picks one. */
+const freePort = () =>
+  new Promise((resolve) => {
+    const probe = http.createServer().listen(0, "127.0.0.1", () => {
+      const address = probe.address();
+      const port = typeof address === "object" && address ? address.port : 0;
+      probe.close(() => resolve(port));
+    });
+  });
+
+/**
+ * Resolves when the shim prints its listening line.
+ * @param {import("node:child_process").ChildProcess} child
+ * @returns {Promise<void>}
+ */
+const listening = (child) =>
+  new Promise((resolve) => {
+    child.stderr?.on("data", (d) => String(d).includes("listening on") && resolve());
+  });
+
 let shim;
 let port;
 before(async () => {
-  port = await new Promise((resolve) => {
-    const probe = http.createServer().listen(0, "127.0.0.1", () => {
-      const p = probe.address().port;
-      probe.close(() => resolve(p));
-    });
-  });
+  port = await freePort();
   shim = spawn(process.execPath, [join(ROOT, "shim/server.mjs")], {
     env: {
       ...process.env,
@@ -87,10 +102,15 @@ before(async () => {
     },
     stdio: ["ignore", "ignore", "pipe"],
   });
-  await new Promise((resolve) => shim.stderr.on("data", (d) => String(d).includes("listening on") && resolve()));
+  await listening(shim);
 });
 after(() => shim.kill());
 
+/**
+ * @param {unknown} body
+ * @param {Record<string, string>} [headers]
+ * @returns {Promise<{ status: number | undefined, data: string }>}
+ */
 function request(body, headers = {}) {
   return new Promise((resolve, reject) => {
     const req = http.request({ host: "127.0.0.1", port, method: "POST", path: "/v1/messages", headers }, (res) => {
@@ -102,8 +122,16 @@ function request(body, headers = {}) {
     req.end(typeof body === "string" ? body : JSON.stringify(body));
   });
 }
+/**
+ * A request body. The tool list is deliberately loose: the tests send
+ * malformed tool definitions on purpose, so the type cannot be narrower than
+ * what the shim has to reject.
+ * @param {...any} m
+ */
 const msgs = (...m) => ({ model: "claude-sonnet-5", messages: m });
+/** @param {any} content */
 const user = (content) => ({ role: "user", content });
+/** @param {{ data: string }} r */
 const text = (r) => JSON.parse(r.data).content.map((b) => b.text ?? "").join("");
 
 test("null and non-object bodies are 400, shim survives", async () => {
@@ -114,6 +142,7 @@ test("null and non-object bodies are 400, shim survives", async () => {
 
 for (const stream of [false, true]) {
   test(`malformed messages and tools fail before response streaming (stream=${stream})`, async () => {
+    /** @type {[string, any][]} Malformed bodies on purpose, so the type stays open. */
     const invalid = [
       ["missing messages", {}],
       ["empty messages", { messages: [] }],
@@ -372,13 +401,15 @@ test("rewritten historical tool outputs and removed images preserve reuse", asyn
 });
 
 const echoTool = { name: "echo", description: "original description", input_schema: { type: "object", properties: {} } };
-for (const [change, beforeTools, afterTools] of [
+/** @type {[string, any[], any[]][]} The change, the tools before, the tools after. */
+const toolChanges = [
   ["added", [], [echoTool]],
   ["removed", [echoTool], []],
   ["renamed", [echoTool], [{ ...echoTool, name: "other" }]],
   ["description", [echoTool], [{ ...echoTool, description: "new description" }]],
   ["schema", [echoTool], [{ ...echoTool, input_schema: { type: "object", properties: { value: { type: "string" } } } }]],
-]) {
+];
+for (const [change, beforeTools, afterTools] of toolChanges) {
   test(`tool definitions ${change} rebuild and reach the new child`, async () => {
     const opening = user(`ARGS tools ${change}`);
     const first = JSON.parse((await request({ ...msgs(opening), tools: beforeTools })).data);
@@ -445,12 +476,7 @@ test("child chatter while parked does not defeat the idle sweep", async () => {
   // The real CLI emits periodic stdout lines while parked; they used to
   // refresh conv.last, so idle conversations never reaped (7h+ in
   // production) and every shim deploy wedged on the busy deadline.
-  const sweepPort = await new Promise((resolve) => {
-    const probe = http.createServer().listen(0, "127.0.0.1", () => {
-      const p = probe.address().port;
-      probe.close(() => resolve(p));
-    });
-  });
+  const sweepPort = await freePort();
   const sweepShim = spawn(process.execPath, [join(ROOT, "shim/server.mjs")], {
     env: {
       ...process.env,
@@ -462,7 +488,7 @@ test("child chatter while parked does not defeat the idle sweep", async () => {
     stdio: ["ignore", "ignore", "pipe"],
   });
   try {
-    await new Promise((resolve) => sweepShim.stderr.on("data", (d) => String(d).includes("listening on") && resolve()));
+    await listening(sweepShim);
     const base = `http://127.0.0.1:${sweepPort}`;
     const res = await fetch(base + "/v1/messages", {
       method: "POST",

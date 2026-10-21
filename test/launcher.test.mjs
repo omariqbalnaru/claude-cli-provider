@@ -21,7 +21,8 @@ function executable(path, content) {
 
 test("render refuses invalid ports instead of producing unusable URLs", () => {
   for (const port of [0, -1, 65536, NaN, 1.5, "8792/path"]) {
-    assert.throws(() => render("models-json", port), /port/i);
+    // The port is a number; the string case is a string on purpose.
+    assert.throws(() => render("models-json", /** @type {any} */ (port)), /port/i);
   }
 });
 
@@ -36,13 +37,17 @@ async function launcher(t, source) {
   // Reserve a port without starting the real shim or Claude CLI.
   const http = await import("node:http");
   const probe = http.createServer();
-  await new Promise((resolve) => probe.listen(0, "127.0.0.1", resolve));
-  const port = probe.address().port;
+  await new Promise((resolve) => probe.listen(0, "127.0.0.1", () => resolve(undefined)));
+  const address = probe.address();
+  const port = typeof address === "object" && address ? address.port : 0;
   await new Promise((resolve) => probe.close(resolve));
   process.env.CLAUDE_SHIM_PORT = String(port);
   process.env.CLAUDE_SHIM_LOG = join(dir, "startup.log");
   t.after(() => {
-    for (const [key, value] of [["CLAUDE_SHIM_PORT", saved.port], ["CLAUDE_SHIM_LOG", saved.log]]) {
+    for (const [key, value] of /** @type {[string, string | undefined][]} */ ([
+      ["CLAUDE_SHIM_PORT", saved.port],
+      ["CLAUDE_SHIM_LOG", saved.log],
+    ])) {
       if (value === undefined) delete process.env[key]; else process.env[key] = value;
     }
     const pidFile = join(dir, "shim/pid");
@@ -51,7 +56,7 @@ async function launcher(t, source) {
     }
     rmSync(dir, { recursive: true, force: true });
   });
-  return { dir, module: await import(pathToFileURL(join(dir, "src/launcher.mjs"))) };
+  return { dir, module: await import(pathToFileURL(join(dir, "src/launcher.mjs")).href) };
 }
 
 test("client boot waits for health and reuses one detached Node process", async (t) => {
@@ -161,16 +166,26 @@ esac
   return { repo, pkg, commands, dir };
 }
 
-for (const [name, extraEnv] of [
+/** The failure and the env it sets. @type {[string, Record<string, string>][]} */
+const deployFailures = [
   ["failed health probe", { HEALTH_FAIL: "1" }],
   ["malformed health response", { HEALTH_BODY: '{"ok":true}' }],
   ["busy conversations at deadline", {}],
   ["failed git archive", { ARCHIVE_FAIL: "1" }],
-]) {
+];
+for (const [name, extraEnv] of deployFailures) {
   test(`deploy aborts before replacing live files on ${name}`, (t) => {
     const { repo, pkg, commands, dir } = deployFixture(t);
+    const env = {
+      ...process.env,
+      PATH: `${commands}:${process.env.PATH}`,
+      OMP_PKG: pkg,
+      CLAUDE_SHIM_PORT: "18999",
+      RSYNC_MARKER: join(dir, "rsync-called"),
+      ...extraEnv,
+    };
     const result = spawnSync("/bin/bash", [join(repo, "scripts/sync-to-omp.sh")], {
-      env: { ...process.env, PATH: `${commands}:${process.env.PATH}`, OMP_PKG: pkg, CLAUDE_SHIM_PORT: "18999", RSYNC_MARKER: join(dir, "rsync-called"), ...extraEnv },
+      env,
       encoding: "utf8", timeout: 10000,
     });
     assert.notEqual(result.status, 0, result.stdout + result.stderr);

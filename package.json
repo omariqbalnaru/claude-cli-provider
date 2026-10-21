@@ -23,7 +23,7 @@
     ]
   },
   "scripts": {
-    "test": "node scripts/check-models.mjs && npm run typecheck && node --test test/*.test.mjs",
+    "test": "node scripts/check-scripts.mjs && node scripts/check-models.mjs && npm run typecheck && node --test test/*.test.mjs",
     "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.js.json",
     "check:config": "node scripts/check-config.mjs",
     "merge:opencode": "node shim/merge.mjs opencode"

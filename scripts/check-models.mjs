@@ -8,27 +8,12 @@
  * like claude-opus-4-20250514 are not pins.
  *
  * No CLI spawn, no subscription turn. Skips cleanly when claude is not on
- * PATH (CI) so `npm test` stays green off this machine.
+ * PATH (CI) so `npm test` stays green off this machine. The decision itself
+ * lives in shim/models.mjs and is covered by test/freshness.test.mjs.
  */
 import { execSync, spawnSync } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
-import { MODELS } from "../shim/models.mjs";
-
-const tuple = (id) => {
-  const m = id.match(/^claude-(opus|sonnet|fable|haiku)-(\d)-(\d)$/);
-  return m && { family: m[1], v: [Number(m[2]), Number(m[3])] };
-};
-
-const rank = ([major, minor]) => major * 100 + minor;
-
-const catalogNewest = new Map();
-for (const model of MODELS) {
-  if (model.cli) continue; // aliases resolve at spawn time; not bundle strings
-  const t = tuple(model.id);
-  if (!t) continue;
-  const known = catalogNewest.get(t.family);
-  if (!known || rank(t.v) > rank(known)) catalogNewest.set(t.family, t.v);
-}
+import { findNewerModels } from "../shim/models.mjs";
 
 let bundle;
 try {
@@ -50,17 +35,7 @@ if (grep.error || grep.status === null) {
   process.exit(0);
 }
 
-const newer = new Map();
-for (const id of new Set((grep.stdout ?? "").split("\n").filter(Boolean))) {
-  const t = tuple(id);
-  if (!t) continue;
-  const known = catalogNewest.get(t.family) ?? [0, 0];
-  if (rank(t.v) > rank(known)) {
-    if (!newer.has(t.family)) newer.set(t.family, new Set());
-    newer.get(t.family).add(id);
-  }
-}
-
+const newer = findNewerModels(grep.stdout ?? "");
 if (newer.size === 0) {
   console.log(`catalog is current with the installed claude CLI (${bundle})`);
   process.exit(0);

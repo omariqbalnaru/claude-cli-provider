@@ -55,3 +55,36 @@ export const EFFORTS_BY_MODEL = {
 export const PROVIDER_ID = "claude-cli";
 export const PROVIDER_NAME = "Claude (Pro/Max via claude CLI)";
 export const DEFAULT_PORT = 8792;
+
+/**
+ * Model ids a CLI bundle mentions that are NEWER than the catalog's newest
+ * for their family — the "a release shipped, the catalog didn't" signal.
+ * `bundleText` is whatever the bundle grep extracted; older ids, dated ids
+ * and the alias slugs are not findings.
+ */
+export function findNewerModels(bundleText, catalog = MODELS) {
+  const tuple = (id) => {
+    const m = id.match(/^claude-(opus|sonnet|fable|haiku)-(\d)-(\d)$/);
+    return m && { family: m[1], v: [Number(m[2]), Number(m[3])] };
+  };
+  const rank = ([major, minor]) => major * 100 + minor;
+  const newest = new Map();
+  for (const model of catalog) {
+    if (model.cli) continue; // aliases resolve at spawn; not bundle strings
+    const t = tuple(model.id);
+    if (!t) continue;
+    const known = newest.get(t.family);
+    if (!known || rank(t.v) > rank(known)) newest.set(t.family, t.v);
+  }
+  const newer = new Map();
+  for (const id of new Set(String(bundleText).split("\n").filter(Boolean))) {
+    const t = tuple(id);
+    if (!t) continue;
+    const known = newest.get(t.family) ?? [0, 0];
+    if (rank(t.v) > rank(known)) {
+      if (!newer.has(t.family)) newer.set(t.family, new Set());
+      newer.get(t.family).add(id);
+    }
+  }
+  return newer;
+}

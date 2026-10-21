@@ -188,10 +188,17 @@ merge doesn't fire post-commit, so run the script by hand after one.
   construct; the prompt clarification and tool-description decoration for it
   live in an OMP-local extension, not here, so they can't leak to pi or
   Command Code.
-- **pi and OMP disagree on `baseUrl`.** pi appends `/v1/messages` itself; OMP
+- **Pi and OMP disagree on `baseUrl`.** pi appends `/v1/messages` itself; OMP
   accepts either form. The registered provider omits the `/v1` prefix, which
   both accept. Command Code's mod transport keeps it, since `@ai-sdk/anthropic`
-  expects it there.
+  expects it there. The opencode block keeps it too: its
+  `settings.baseURL` is passed to `@opencode/ai/providers/anthropic-compatible`,
+  which appends `/messages`.
+- **The opencode block targets opencode v2 config.** `claude-shim models
+  opencode` emits `providers.claude-cli` with `package`/`settings` — not v1's
+  `provider`/`npm`/`options`, which v2 deprecates — and model entries carry
+  `name` + `limit` only. Tool and text/image capabilities use v2's fallback
+  assumptions for uncatalogued models, which match Claude.
 - **Billing.** Uses your subscription quota the way interactive Claude Code
   does, because it IS Claude Code (`claude -p`). Tool calls from the harness
   are served to the child over an stdio MCP bridge and parked until the

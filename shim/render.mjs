@@ -100,24 +100,34 @@ export function render(fmt, port = DEFAULT_PORT) {
     );
   }
   if (fmt === "opencode") {
-    // opencode (AI SDK): @ai-sdk/anthropic speaks the Anthropic Messages
-    // protocol the shim already serves, so only baseURL + model catalog differ.
-    // opencode has no thinking API, so each model also gets `:effort` variants
-    // (the shim strips the suffix and passes it as the CLI's --effort).
+    // opencode v2 config: `providers.<id>` with `package` + `settings` (v1's
+    // `provider.<id>`, `npm`, `options` and the model `reasoning` flag are
+    // deprecated there). The native anthropic-compatible package speaks the
+    // Anthropic Messages protocol the shim already serves and appends
+    // `/messages` itself, so only baseURL + model catalog differ.
+    // opencode has no thinking API on this route, so each model also gets
+    // `:effort` variants (the shim strips the suffix and passes it as the
+    // CLI's --effort), and max-effort turns wait on the CLI past opencode's
+    // default HTTP limits, so the block widens the timeouts.
     return JSON.stringify(
       {
         $schema: "https://opencode.ai/config.json",
-        provider: {
+        providers: {
           [PROVIDER_ID]: {
-            npm: "@ai-sdk/anthropic",
             name: PROVIDER_NAME,
-            options: { baseURL: `${base}/v1`, apiKey: "claude-shim" },
+            package: "@opencode/ai/providers/anthropic-compatible",
+            settings: {
+              baseURL: `${base}/v1`,
+              apiKey: "claude-shim",
+              headerTimeout: 600000,
+              chunkTimeout: false,
+            },
             models: Object.fromEntries(
               MODELS.flatMap((m) => [
-                [m.id, { name: m.name, limit: { context: m.context, output: m.out }, reasoning: true }],
+                [m.id, { name: m.name, limit: { context: m.context, output: m.out } }],
                 ...effortsFor(m.id).map((e) => [
                   `${m.id}:${e}`,
-                  { name: `${m.name} (${e} effort)`, limit: { context: m.context, output: m.out }, reasoning: true },
+                  { name: `${m.name} (${e} effort)`, limit: { context: m.context, output: m.out } },
                 ]),
               ]),
             ),

@@ -38,6 +38,12 @@ rl.on("line", async (line) => {
   if (text.includes("PID")) return say("pid " + process.pid);
   if (text.includes("ARGS")) return say(JSON.stringify({ pid: process.pid, argv: process.argv.slice(2), tools: JSON.parse(fs.readFileSync(bridge.CLAUDE_BRIDGE_TOOLS, "utf8")), cwd: process.cwd(), files: fs.readdirSync(process.cwd()), memory: process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY }));
   if (text.includes("FALLBACK")) return say("fallback answer", "claude-opus-4-8");
+  if (text.includes("CHATTER")) {
+    // Like the real CLI between turns: keeps emitting stdout lines while parked.
+    say("echo: " + text);
+    setInterval(() => out({ type: "stream_event", event: { type: "message_delta", usage: { output_tokens: 0 } } }), 100);
+    return;
+  }
   if (text.includes("FAIL")) {
     out({ type: "assistant", error: "rate_limit", message: { model: "<synthetic>", content: [{ type: "text", text: "usage limit hit" }], stop_reason: "stop_sequence" } });
     return out({ type: "result", subtype: "success", is_error: true, result: "usage limit hit" });
@@ -433,4 +439,44 @@ test("the same opening in two sessions gets two children", async () => {
   // Session 1 is still on its own live child.
   const again = JSON.parse((await request(msgs(user("PID session"), { role: "assistant", content: a.content }, user("PID again")), s1)).data);
   assert.equal(again.content[0].text, a.content[0].text);
+});
+
+test("child chatter while parked does not defeat the idle sweep", async () => {
+  // The real CLI emits periodic stdout lines while parked; they used to
+  // refresh conv.last, so idle conversations never reaped (7h+ in
+  // production) and every shim deploy wedged on the busy deadline.
+  const sweepPort = await new Promise((resolve) => {
+    const probe = http.createServer().listen(0, "127.0.0.1", () => {
+      const p = probe.address().port;
+      probe.close(() => resolve(p));
+    });
+  });
+  const sweepShim = spawn(process.execPath, [join(ROOT, "shim/server.mjs")], {
+    env: {
+      ...process.env,
+      PATH: `${dir}:${process.env.PATH}`,
+      CLAUDE_SHIM_PORT: String(sweepPort),
+      CLAUDE_SHIM_IDLE_MS: "1000",
+      CLAUDE_SHIM_SWEEP_MS: "300",
+    },
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  try {
+    await new Promise((resolve) => sweepShim.stderr.on("data", (d) => String(d).includes("listening on") && resolve()));
+    const base = `http://127.0.0.1:${sweepPort}`;
+    const res = await fetch(base + "/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({ model: "claude-haiku", messages: [user("CHATTER")] }),
+    });
+    assert.equal(res.status, 200);
+    assert.equal((JSON.parse(await res.text())).stop_reason, "end_turn");
+    let conversations = 1;
+    for (let i = 0; i < 40 && conversations !== 0; i++) {
+      await new Promise((r) => setTimeout(r, 250));
+      conversations = (JSON.parse(await (await fetch(base + "/healthz")).text())).conversations;
+    }
+    assert.equal(conversations, 0, "chattering child must still be reaped when idle");
+  } finally {
+    sweepShim.kill();
+  }
 });

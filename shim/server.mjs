@@ -44,6 +44,8 @@ function cliModel(id) {
 
 const PORT = Number(process.env.CLAUDE_SHIM_PORT ?? DEFAULT_PORT);
 const IDLE_MS = Number(process.env.CLAUDE_SHIM_IDLE_MS ?? 10 * 60 * 1000);
+// Sweep cadence is configurable so tests can exercise idle reaping quickly.
+const SWEEP_MS = Number(process.env.CLAUDE_SHIM_SWEEP_MS ?? 60_000);
 const TURN_TIMEOUT_MS = Number(process.env.CLAUDE_SHIM_TURN_TIMEOUT_MS ?? 15 * 60 * 1000);
 
 const MCP_SERVER_NAME = "cctools";
@@ -410,7 +412,10 @@ function createConversation({ key, system, tools, model, effort }) {
     } catch {
       return; // non-JSON noise on stdout; ignore
     }
-    conv.last = Date.now();
+    // Liveness must track caller requests (handleMessages refreshes
+    // conv.last), not child output: the CLI also emits periodic stdout lines
+    // while parked, and refreshing on those kept idle conversations alive
+    // forever in production, wedging every shim deploy on a busy deadline.
     q.push(msg);
   });
   child.stderr.setEncoding("utf8");
@@ -479,7 +484,7 @@ setInterval(() => {
       destroyConversation(key);
     }
   }
-}, 60_000).unref();
+}, SWEEP_MS).unref();
 
 // ---- turn handling ---------------------------------------------------------
 

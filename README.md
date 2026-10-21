@@ -77,6 +77,7 @@ Startup failures report the log path; Node is required, with no Bun fallback.
 |---|---|---|
 | `CLAUDE_SHIM_PORT` | `8792` | listen port |
 | `CLAUDE_SHIM_IDLE_MS` | 10 min | idle conversations are closed after this (1 h while waiting on a tool) |
+| `CLAUDE_SHIM_SWEEP_MS` | 60 s | how often idle conversations are checked for reaping |
 | `CLAUDE_SHIM_TURN_TIMEOUT_MS` | 15 min | a turn still running after this fails with a 504 |
 | `CLAUDE_SHIM_LOG` | `${TMPDIR:-/tmp}/claude-shim.log` | launcher log path |
 

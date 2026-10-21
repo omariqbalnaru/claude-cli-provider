@@ -37,8 +37,8 @@ pi install <this-package>
 cmd mods add -g <this-package>
 
 # OpenCode — print the provider block, then merge it by hand into
-# ~/.config/opencode/opencode.json (or project opencode.json). Don't redirect
-# onto the file: that replaces your whole config.
+# ~/.config/opencode/opencode.jsonc (or a project opencode.json). Don't
+# redirect onto the file: that replaces your whole config.
 claude-shim models opencode
 ```
 

@@ -10,6 +10,7 @@
 // dialog edges, the row pads 3 cells each side and the title's own padding
 // takes 3 more, so 58 - 12 = 46 cells are left for the name and the provider
 // together. 46 is what a 60-column terminal leaves; a wider one leaves more.
+// Measured against opencode v2.1.2.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { render } from "../shim/render.mjs";

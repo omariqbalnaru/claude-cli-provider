@@ -11,6 +11,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      # The catalog freshness check skips itself without a local claude CLI;
-      # the wire tests run against a stub claude and need no dependencies.
+      # The wire tests drive a stub claude on PATH: no seat, no quota, no
+      # network. The install is for the type-check (typescript and the pi SDK
+      # types); the extension sources are never type-checked without it.
+      - run: npm install --no-audit --no-fund
       - run: npm test

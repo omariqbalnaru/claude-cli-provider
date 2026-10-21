@@ -159,14 +159,15 @@ sessions with the same opening get separate children.
 ## Development
 
 ```bash
-npm test                  # catalog freshness check, then node --test against a stub claude CLI
+npm test                  # catalog freshness check, type-check, then node --test against a stub claude CLI
 scripts/sync-to-omp.sh    # deploy HEAD into ~/.omp/... and restart the shim when idle
 ```
 
 A local `pre-commit` hook runs `npm test` before every commit: the
 post-commit hook deploys HEAD and restarts the shim, so a red HEAD would
 ship a broken shim to every harness. The suite is hermetic — a stub `claude`
-on PATH, no seat, no quota, no network.
+on PATH, no seat, no quota, no network; the type-check needs `npm install`
+once (typescript and the pi SDK's types).
 
 The sync script deploys the last commit, not the working tree, and copies
 `shim/`, `src/`, `bin/` and package metadata into an existing install. Changed

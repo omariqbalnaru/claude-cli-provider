@@ -23,7 +23,8 @@
     ]
   },
   "scripts": {
-    "test": "node scripts/check-models.mjs && node --test test/*.test.mjs"
+    "test": "node scripts/check-models.mjs && tsc --noEmit && node --test test/*.test.mjs",
+    "typecheck": "tsc --noEmit"
   },
   "bin": {
     "claude-shim": "./bin/claude-shim"
@@ -56,5 +57,9 @@
   "homepage": "https://github.com/omariqbalnaru/claude-cli-provider#readme",
   "bugs": {
     "url": "https://github.com/omariqbalnaru/claude-cli-provider/issues"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^1.3.0",
+    "typescript": "^5.9.3"
   }
 }

@@ -991,8 +991,13 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method === "GET" && path === "/healthz") {
+    // oldest_idle_ms lets one curl tell live traffic from stale leftovers:
+    // ms since the longest-idle conversation's last caller request.
+    const now = Date.now();
+    let oldest = 0;
+    for (const conv of conversations.values()) oldest = Math.max(oldest, now - conv.last);
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ ok: true, conversations: conversations.size }));
+    res.end(JSON.stringify({ ok: true, conversations: conversations.size, oldest_idle_ms: oldest }));
     return;
   }
 

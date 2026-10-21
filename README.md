@@ -93,7 +93,11 @@ Startup failures report the log path; Node is required, with no Bun fallback.
 
 `shim/models.mjs` is the single source of truth — the shim's `/v1/models`
 listing, the registered provider, and the rendered config blocks all read it, so
-they cannot drift apart. Add a model by adding one entry there.
+they cannot drift apart. Add a model by adding one entry there. `npm test`
+greps the installed claude CLI bundle and fails when it references a model
+newer than the catalog's newest for that family — add the entry and re-merge
+the opencode block. The `(latest)` aliases resolve at spawn time, so they pick
+up new releases with no catalog change.
 
 ## Layout
 
@@ -155,7 +159,7 @@ sessions with the same opening get separate children.
 ## Development
 
 ```bash
-npm test                  # node --test against a stub claude CLI
+npm test                  # catalog freshness check, then node --test against a stub claude CLI
 scripts/sync-to-omp.sh    # deploy HEAD into ~/.omp/... and restart the shim when idle
 ```
 

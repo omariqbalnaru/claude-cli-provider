@@ -473,7 +473,9 @@ test("child chatter while parked does not defeat the idle sweep", async () => {
     let conversations = 1;
     for (let i = 0; i < 40 && conversations !== 0; i++) {
       await new Promise((r) => setTimeout(r, 250));
-      conversations = (JSON.parse(await (await fetch(base + "/healthz")).text())).conversations;
+      const h = JSON.parse(await (await fetch(base + "/healthz")).text());
+      assert.ok(Number.isSafeInteger(h.oldest_idle_ms), "healthz reports oldest_idle_ms");
+      conversations = h.conversations;
     }
     assert.equal(conversations, 0, "chattering child must still be reaped when idle");
   } finally {

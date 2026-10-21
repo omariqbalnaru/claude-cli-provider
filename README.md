@@ -163,11 +163,16 @@ npm test                  # catalog freshness check, type-check, then node --tes
 scripts/sync-to-omp.sh    # deploy HEAD into ~/.omp/... and restart the shim when idle
 ```
 
+The type-check runs two passes: the TypeScript sources under full `strict`,
+and the `.mjs` shim under `checkJs` with `noImplicitAny` off — the JavaScript
+keeps property, argument and null checking without demanding annotations on
+code that has never had them. `npm install` once provides typescript and the
+node types.
+
 A local `pre-commit` hook runs `npm test` before every commit: the
 post-commit hook deploys HEAD and restarts the shim, so a red HEAD would
 ship a broken shim to every harness. The suite is hermetic — a stub `claude`
-on PATH, no seat, no quota, no network; the type-check needs `npm install`
-once (typescript and the pi SDK's types).
+on PATH, no seat, no quota, no network.
 
 The sync script deploys the last commit, not the working tree, and copies
 `shim/`, `src/`, `bin/` and package metadata into an existing install. Changed

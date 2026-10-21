@@ -12,10 +12,16 @@ const TOOLS_FILE = process.env.CLAUDE_BRIDGE_TOOLS;
 const CONV = process.env.CLAUDE_BRIDGE_CONV ?? "";
 
 let defs = [];
-try {
-  defs = JSON.parse(fs.readFileSync(TOOLS_FILE, "utf8"));
-} catch (e) {
-  process.stderr.write(`[mcp-bridge] failed to read tools file: ${e?.message ?? e}\n`);
+if (!TOOLS_FILE) {
+  // An unset tools file means the bridge advertises no tools, and the model
+  // silently loses every caller tool. Say so loudly instead.
+  process.stderr.write("[mcp-bridge] CLAUDE_BRIDGE_TOOLS is not set: no tools will be served\n");
+} else {
+  try {
+    defs = JSON.parse(fs.readFileSync(TOOLS_FILE, "utf8"));
+  } catch (e) {
+    process.stderr.write(`[mcp-bridge] failed to read tools file: ${e?.message ?? e}\n`);
+  }
 }
 
 const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\n");

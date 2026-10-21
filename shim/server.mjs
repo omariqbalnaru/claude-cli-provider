@@ -130,21 +130,24 @@ function convKey(model, system, messages, sessionId) {
 function ownText(content) {
   return userBlocks(content)
     .filter((b) => b.type === "text")
-    .map((b) => b.text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, ""))
+    .map((b) => (b.text ?? "").replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, ""))
     .filter(Boolean)
     .join("\n");
 }
 
 // A user message's own input as Anthropic blocks: text and images, minus
 // tool_results and client-side extras like cache_control.
+/** @returns {{type: string, text?: string, source?: any}[]} */
 function userBlocks(content) {
   if (typeof content === "string") return content ? [{ type: "text", text: content }] : [];
   if (!Array.isArray(content)) return [];
-  return content.flatMap((b) =>
-    b?.type === "text" && b.text ? [{ type: "text", text: b.text }]
-    : b?.type === "image" && b.source ? [{ type: "image", source: b.source }]
-    : [],
-  );
+  /** @type {{type: string, text?: string, source?: any}[]} */
+  const out = [];
+  for (const b of content) {
+    if (b?.type === "text" && b.text) out.push({ type: "text", text: b.text });
+    else if (b?.type === "image" && b.source) out.push({ type: "image", source: b.source });
+  }
+  return out;
 }
 
 // A tool_result's content as Anthropic blocks (text + images), never empty.
@@ -273,8 +276,9 @@ const internalServer = http.createServer((req, res) => {
 });
 await new Promise((resolve) => {
   internalServer.listen(0, "127.0.0.1", () => {
-    internalPort = internalServer.address().port;
-    resolve();
+    const address = internalServer.address();
+    internalPort = typeof address === "object" && address ? address.port : 0;
+    resolve(undefined);
   });
 });
 
@@ -424,7 +428,7 @@ function createConversation({ key, system, tools, model, effort }) {
   });
   // A queued write to a dead child raises EPIPE here; unhandled, it kills the
   // whole shim. The close handler below already tears the conversation down.
-  child.stdin.on("error", (e) => log("claude stdin error:", e?.code ?? e));
+  child.stdin.on("error", (e) => log("claude stdin error:", /** @type {any} */ (e)?.code ?? e));
   // A dead child must leave the map, or every later request on this key gets
   // an instant empty reply from its ended queue. 'close' (not 'exit') so the
   // last stdout lines are read first; the identity check matters because an
@@ -560,7 +564,7 @@ async function nextTurn(conv) {
     if (msg.type === "stream_event") {
       // message_delta carries the model call's final output count; the
       // per-block assistant events only have the count so far.
-      if (msg.event?.type === "message_delta" && msg.event.usage) usage = { ...usage, ...msg.event.usage };
+      if (msg.event?.type === "message_delta" && msg.event.usage) usage = { ...(usage ?? {}), ...msg.event.usage };
       if (sawToolUse && msg.event?.type === "message_stop") break;
       continue;
     }
@@ -1093,7 +1097,7 @@ const server = http.createServer(async (req, res) => {
 // fire more than once. Whoever already owns the port is serving, so exit
 // quietly instead of crashing noisily into the log.
 server.on("error", (e) => {
-  if (e?.code === "EADDRINUSE") {
+  if (/** @type {any} */ (e)?.code === "EADDRINUSE") {
     log(`port ${PORT} already in use — another shim is serving; exiting`);
     process.exit(0);
   }

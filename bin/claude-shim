@@ -7,6 +7,8 @@
 #   claude-shim logs      tail its log
 #   claude-shim models <providers-json|models-yml|models-json|opencode> [port]
 #                         render this catalog as a harness config
+#   claude-shim config merge opencode [--dry-run] [--config PATH]
+#                         merge the opencode block into an OpenCode config
 #
 # Auth comes from Claude Code's own Keychain entry — the shim spawns the
 # official `claude` CLI, which owns authentication.
@@ -53,6 +55,15 @@ case "${1:-start}" in
   models)
     require_node
     exec node "$SHIM_DIR/server.mjs" models "${2:-providers-json}" "${3:-$PORT}"
+    ;;
+  config)
+    require_node
+    if [ "${2:-}" != "merge" ]; then
+      echo "usage: claude-shim config merge opencode [--dry-run] [--config PATH]" >&2
+      exit 2
+    fi
+    shift 2
+    exec node "$SHIM_DIR/merge.mjs" opencode --port "$PORT" "$@"
     ;;
   start)
     require_node

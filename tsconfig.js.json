@@ -12,5 +12,5 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["shim/**/*.mjs", "src/**/*.mjs"]
+  "include": ["shim/**/*.mjs", "scripts/**/*.mjs", "src/**/*.mjs", "test/merge.test.mjs", "test/config-check.test.mjs", "test/picker.test.mjs", "test/freshness.test.mjs", "test/render.test.mjs"]
 }

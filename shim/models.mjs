@@ -39,6 +39,14 @@ export const MODELS = [
  */
 export const ALIAS_MODELS = MODELS.filter((model) => model.cli);
 
+/**
+ * The effort levels opencode offers as native variants. opencode v2 sends
+ * them as `output_config.effort` on the Anthropic wire, which the shim reads
+ * and passes to the CLI as `--effort`; a client with no thinking API (pi)
+ * uses the same ladder through `thinkingLevelMap`.
+ */
+export const OPENCODE_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+
 /** Thinking efforts each model accepts, least → most intensive. */
 export const EFFORTS_BY_MODEL = {
   "claude-sonnet-5-5": ["low", "medium", "high", "xhigh", "max"],

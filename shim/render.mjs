@@ -4,7 +4,7 @@
  * shared catalog (models.mjs) into each harness's hand-written config shape.
  */
 
-import { MODELS, ALIAS_MODELS, DEFAULT_PORT, EFFORTS_BY_MODEL, PROVIDER_ID, PROVIDER_NAME } from "./models.mjs";
+import { MODELS, ALIAS_MODELS, OPENCODE_EFFORTS, DEFAULT_PORT, EFFORTS_BY_MODEL, PROVIDER_ID, PROVIDER_NAME } from "./models.mjs";
 
 export { PROVIDER_ID, PROVIDER_NAME };
 
@@ -122,16 +122,24 @@ export function render(fmt, port = DEFAULT_PORT) {
               chunkTimeout: false,
             },
             models: Object.fromEntries(
-              // The aliases only: each resolves to the newest release of its
-              // family, so the picker never offers a superseded version.
-              ALIAS_MODELS.flatMap((m) => [
-                [m.id, { name: m.name, limit: { context: m.context, output: m.out } }],
-                ...effortsFor(m.id).map((e) => [
-                  `${m.id}:${e}`,
-                  // "(low)", not "(low effort)": the picker gives the model name
-                  // only the cells the provider label leaves over.
-                  { name: `${m.name} (${e})`, limit: { context: m.context, output: m.out } },
-                ]),
+              // One entry per model, no effort suffix: opencode v2 carries
+              // effort as a native variant, and a second picker for the same
+              // choice is a step the user should not have to take. The
+              // capability block below is what makes opencode offer that
+              // variant; the shim reads the effort it sends and passes it to
+              // the CLI.
+              ALIAS_MODELS.map((m) => [
+                m.id,
+                {
+                  name: m.name,
+                  limit: { context: m.context, output: m.out },
+                  capabilities: {
+                    reasoning: {
+                      supported: true,
+                      effort: OPENCODE_EFFORTS,
+                    },
+                  },
+                },
               ]),
             ),
           },

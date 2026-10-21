@@ -14,10 +14,20 @@ test("a config that matches the rendered block has no drift", () => {
 
 test("a model the block is missing is drift", () => {
   const merged = clone();
-  delete merged.models["claude-opus:max"];
+  delete merged.models["claude-haiku"];
   const problems = configDrift(rendered, merged);
   assert.equal(problems.length, 1);
   assert.match(problems[0], /1 model\(s\) the block is missing/);
+});
+
+test("a suffixed model the block still offers is drift", () => {
+  // The effort suffix is gone from the picker: a config that still carries
+  // one is offering a model opencode no longer lists.
+  const merged = clone();
+  merged.models["claude-opus:high"] = { name: "Claude Opus (latest) (high)", limit: { context: 1, output: 1 } };
+  const problems = configDrift(rendered, merged);
+  assert.equal(problems.length, 1);
+  assert.match(problems[0], /no longer serves/);
 });
 
 test("a model the shim no longer serves is drift", () => {

@@ -36,11 +36,18 @@ pi install <this-package>
 # Command Code
 cmd mods add -g <this-package>
 
-# OpenCode — print the provider block, then merge it by hand into
-# ~/.config/opencode/opencode.jsonc (or a project opencode.json). Don't
-# redirect onto the file: that replaces your whole config.
+# OpenCode — merge the provider block into your config
+claude-shim config merge opencode
+
+# ...or print it and merge it by hand
 claude-shim models opencode
 ```
+
+The merge rewrites only the `claude-cli` block in
+`~/.config/opencode/opencode.jsonc`: your comments, key order and every other
+provider survive untouched. It is idempotent, keeps the previous file as
+`.bak`, and refuses to touch a config that does not parse. `--dry-run` shows
+what it would change; `--config PATH` points it at a different file.
 
 The provider label is short on purpose: opencode's model picker renders it as
 the row's right-hand column, which never shrinks, so a long label clips the
@@ -51,6 +58,12 @@ and its effort variants. Each resolves to the newest release of its family at
 spawn time, so the picker never shows a superseded version and follows the
 CLI when Anthropic ships one. The pinned versions stay in the `/v1/models`
 listing for clients that want an exact version.
+
+Effort is a **native opencode variant**, not a second model list: the block
+declares `capabilities.reasoning.effort`, so opencode offers one effort
+selector and sends the choice as `output_config.effort`. The shim reads it
+and passes it to the CLI as `--effort`. (The `:effort` model-id suffix still
+works for clients with no thinking API, but opencode does not need it.)
 
 OMP and pi load `src/extension.ts` (both read the `pi.extensions` key).
 Command Code loads `src/mod.ts` (the `commandcode.mods` key).

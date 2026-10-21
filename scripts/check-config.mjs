@@ -14,15 +14,14 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { configDrift } from "../shim/config-check.mjs";
+import { stripComments } from "../shim/merge.mjs";
 import { render } from "../shim/render.mjs";
 
 const configPath = join(homedir(), ".config/opencode/opencode.jsonc");
 
 let config;
 try {
-  // JSONC: drop the full-line comments before parsing.
-  const text = readFileSync(configPath, "utf8").replace(/^[ \t]*\/\/.*$/gm, "");
-  config = JSON.parse(text);
+  config = JSON.parse(stripComments(readFileSync(configPath, "utf8")));
 } catch (e) {
   if (e.code === "ENOENT") {
     console.log(`no OpenCode config at ${configPath}: skipping the config check`);
